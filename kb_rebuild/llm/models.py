@@ -6,6 +6,8 @@ from dataclasses import dataclass
 PRIMARY_TAGGING_MODEL = "deepseek/deepseek-v4-flash"
 NORMALIZATION_MODEL = "deepseek/deepseek-v4-pro"
 FALLBACK_TAGGING_MODEL = "google/gemini-3.1-flash-lite-preview"
+GEMINI_FLASH_TAGGING_MODEL = "google/gemini-3-flash-preview"
+GEMINI_FLASH_MODEL = GEMINI_FLASH_TAGGING_MODEL
 
 
 @dataclass(frozen=True)
@@ -27,7 +29,26 @@ MODEL_PRICING: dict[str, ModelPricing] = {
         input_usd_per_million_tokens=0.25,
         output_usd_per_million_tokens=1.50,
     ),
+    GEMINI_FLASH_TAGGING_MODEL: ModelPricing(
+        input_usd_per_million_tokens=0.50,
+        output_usd_per_million_tokens=3.00,
+    ),
 }
+
+
+MODEL_PRESETS: dict[str, str] = {
+    "deepseek-flash": PRIMARY_TAGGING_MODEL,
+    "gemini-flash": GEMINI_FLASH_TAGGING_MODEL,
+}
+
+
+def model_from_preset(preset: str | None, explicit_model: str) -> str:
+    if not preset:
+        return explicit_model
+    if preset not in MODEL_PRESETS:
+        known = ", ".join(sorted(MODEL_PRESETS))
+        raise ValueError(f"unknown model preset: {preset}; known: {known}")
+    return MODEL_PRESETS[preset]
 
 
 def validate_model_id(model_id: str) -> None:
@@ -71,4 +92,3 @@ def calculate_cost_usd(
     output_token_count = max(completion_tokens, 0) + max(reasoning_tokens, 0)
     output_cost = (output_token_count / 1_000_000) * pricing.output_usd_per_million_tokens
     return round(input_cost + output_cost, 8)
-

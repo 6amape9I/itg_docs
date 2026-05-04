@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://itg.local/schemas/compact_document_tagging.schema.json",
+  "schema_version": "compact_tagging_v2",
+  "title": "CompactDocumentTaggingBatchResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "docs"
+  ],
+  "properties": {
+    "docs": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "d",
+          "e"
+        ],
+        "properties": {
+          "d": {
+            "type": "string",
+            "minLength": 1
+          },
+          "e": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "s",
+                "ru",
+                "t",
+                "r",
+                "c",
+                "q"
+              ],
+              "properties": {
+                "s": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "ru": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "t": {
+                  "type": "string",
+                  "enum": [
+                    "disease",
+                    "drug_trade_name",
+                    "drug_class",
+                    "supplement",
+                    "immunobiological_preparation",
+                    "biological_substance",
+                    "symptom",
+                    "medical_device",
+                    "procedure",
+                    "diagnostic_method",
+                    "organ_or_body_system",
+                    "microorganism",
+                    "cell_or_biological_structure",
+                    "medical_concept",
+                    "instruction",
+                    "other"
+                  ]
+                },
+                "r": {
+                  "type": "string",
+                  "enum": [
+                    "article",
+                    "context",
+                    "folder"
+                  ]
+                },
+                "c": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "q": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

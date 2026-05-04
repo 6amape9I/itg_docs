@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from html import unescape
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
@@ -16,6 +17,7 @@ from kb_rebuild.io.jsonl import read_jsonl, write_jsonl
 from kb_rebuild.llm.cache import LLMCache, build_cache_key, sha256_text
 from kb_rebuild.llm.models import (
     FALLBACK_TAGGING_MODEL,
+    GEMINI_FLASH_MODEL,
     NORMALIZATION_MODEL,
     PRIMARY_TAGGING_MODEL,
     calculate_cost_usd,
@@ -901,12 +903,16 @@ def parse_json_content(content: str) -> tuple[dict[str, Any] | None, list[str]]:
 
 
 def validate_quote_in_text(quote: str, clean_text: str) -> str:
+    if not quote:
+        return "not_found"
+    if quote in clean_text:
+        return "exact"
     quote_norm = _normalize_for_quote_match(quote)
     text_norm = _normalize_for_quote_match(clean_text)
     if not quote_norm:
         return "not_found"
     if quote_norm in text_norm:
-        return "found"
+        return "normalized"
     if len(quote_norm) < 12 or not text_norm:
         return "not_found"
 
@@ -926,9 +932,11 @@ def summarize_quote_statuses(statuses: list[str]) -> str:
         return "no_quotes"
     if any(status == "not_found" for status in statuses):
         return "not_found"
-    if any(status == "fuzzy" for status in statuses):
-        return "fuzzy"
-    return "found"
+    if all(status == "exact" for status in statuses):
+        return "all_exact"
+    if all(status in {"exact", "normalized"} for status in statuses):
+        return "all_found"
+    return "mixed"
 
 
 def utc_now() -> str:
@@ -941,7 +949,10 @@ def _load_prompt() -> str:
 
 
 def _normalize_for_quote_match(value: str) -> str:
-    return " ".join(value.lower().split())
+    normalized = unescape(value).replace("\u00a0", " ")
+    for bullet in ("•", "·", "▪", "◦", "–", "—"):
+        normalized = normalized.replace(bullet, " ")
+    return " ".join(normalized.lower().split())
 
 
 def _safe_usage(value: Any) -> dict[str, int]:
@@ -986,7 +997,7 @@ def _requested_model_key(record: dict[str, Any]) -> str:
     if isinstance(requested_model, str) and requested_model:
         return requested_model
     model = str(record.get("model", ""))
-    for configured_model in (PRIMARY_TAGGING_MODEL, NORMALIZATION_MODEL, FALLBACK_TAGGING_MODEL):
+    for configured_model in (PRIMARY_TAGGING_MODEL, NORMALIZATION_MODEL, FALLBACK_TAGGING_MODEL, GEMINI_FLASH_MODEL):
         if model == configured_model or model.startswith(f"{configured_model}-"):
             return configured_model
     return model

@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://itg.local/schemas/document_tagging_batch_v2.schema.json",
+  "schema_version": "document_tagging_batch_v2",
+  "title": "DocumentTaggingBatchResponseV2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "documents"
+  ],
+  "properties": {
+    "documents": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "doc_id",
+          "entities"
+        ],
+        "properties": {
+          "doc_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "entities": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "surface",
+                "canonical_candidate_ru",
+                "canonical_candidate_latin",
+                "entity_type",
+                "article_candidate",
+                "tag_role",
+                "is_primary",
+                "confidence",
+                "evidence_quotes",
+                "comment"
+              ],
+              "properties": {
+                "surface": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "canonical_candidate_ru": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "canonical_candidate_latin": {
+                  "type": "string"
+                },
+                "entity_type": {
+                  "type": "string",
+                  "enum": [
+                    "disease",
+                    "drug_trade_name",
+                    "drug_class",
+                    "supplement",
+                    "symptom",
+                    "medical_device",
+                    "procedure",
+                    "diagnostic_method",
+                    "organ_or_body_system",
+                    "medical_concept",
+                    "instruction",
+                    "microorganism",
+                    "cell_or_biological_structure",
+                    "biological_substance",
+                    "immunobiological_preparation",
+                    "other"
+                  ]
+                },
+                "tag_role": {
+                  "type": "string",
+                  "enum": [
+                    "article_candidate",
+                    "folder_candidate",
+                    "context_only"
+                  ]
+                },
+                "article_candidate": {
+                  "type": "boolean"
+                },
+                "is_primary": {
+                  "type": "boolean"
+                },
+                "confidence": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "evidence_quotes": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 5,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "comment": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
