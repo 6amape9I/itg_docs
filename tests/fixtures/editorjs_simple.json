@@ -1,0 +1,20 @@
+{
+  "time": 0,
+  "blocks": [
+    {
+      "id": "source_header",
+      "type": "header",
+      "data": {
+        "text": "Гастрит",
+        "level": 2
+      }
+    },
+    {
+      "type": "paragraph",
+      "data": {
+        "text": "<b>Гастрит</b> — воспаление слизистой оболочки желудка."
+      }
+    }
+  ],
+  "version": "2.28.0"
+}

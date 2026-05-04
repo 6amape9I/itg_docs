@@ -1,0 +1,5 @@
+name,description,content
+Simple,Valid simple document,"{""time"":0,""blocks"":[{""type"":""header"",""data"":{""text"":""Гастрит"",""level"":2}},{""type"":""paragraph"",""data"":{""text"":""<b>Гастрит</b> — воспаление желудка.""} }],""version"":""2.28.0""}"
+Broken,Broken JSON,"{bad json"
+Empty,Empty content,
+Mixed,Valid mixed document,"{""time"":0,""blocks"":[{""type"":""list"",""data"":{""items"":[""Пункт A"",{""content"":""Пункт B"",""items"":[{""content"":""Пункт C""}]}]}},{""type"":""table"",""data"":{""content"":[[""Колонка 1"",""Колонка 2""],[""A"",""B""]]}},{""type"":""customBlock"",""data"":{""content"":{""items"":[{""title"":""Вложенный текст""}]}}}],""version"":""2.28.0""}"

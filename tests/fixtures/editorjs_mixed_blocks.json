@@ -1,0 +1,49 @@
+{
+  "time": 0,
+  "blocks": [
+    {
+      "type": "list",
+      "data": {
+        "style": "unordered",
+        "items": [
+          "Первый пункт",
+          {
+            "content": "Второй пункт",
+            "items": [
+              {
+                "content": "Вложенный пункт"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "table",
+      "data": {
+        "content": [
+          ["Препарат", "Дозировка"],
+          ["Тест", "1 таблетка"]
+        ]
+      }
+    },
+    {
+      "type": "customMedicalBlock",
+      "data": {
+        "content": {
+          "items": [
+            {
+              "title": "Скрытый заголовок",
+              "message": "Скрытое сообщение"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "delimiter",
+      "data": {}
+    }
+  ],
+  "version": "2.28.0"
+}
