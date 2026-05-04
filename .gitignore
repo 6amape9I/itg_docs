@@ -2,3 +2,6 @@
 *.xml
 *.iml
 *.idea
+__pycache__/
+*.py[cod]
+/data/
