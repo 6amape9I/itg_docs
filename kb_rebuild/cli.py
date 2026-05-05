@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from kb_rebuild.io.jsonl import write_jsonl
-from kb_rebuild.llm.models import GEMINI_FLASH_TAGGING_MODEL, PRIMARY_TAGGING_MODEL, model_from_preset
+from kb_rebuild.llm.gemini_client import GeminiClient, GeminiError, load_dotenv_gemini_keys
+from kb_rebuild.llm.models import (
+    GEMINI_FLASH_TAGGING_MODEL,
+    MODEL_ROLE_MAPPING,
+    OPENROUTER_DEEPSEEK_FLASH,
+    OPENROUTER_GEMINI_FLASH_TAGGING_MODEL,
+    PRIMARY_TAGGING_MODEL,
+    model_from_preset,
+    model_from_role,
+)
 from kb_rebuild.llm.openrouter_client import OpenRouterClient, load_dotenv_openrouter_key
 from kb_rebuild.llm.tagging_batch import BatchTaggingConfig, run_batch_tagging_calibration
 from kb_rebuild.llm.tagging import TaggingConfig, run_tagging_calibration
@@ -43,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     tag_parser = subparsers.add_parser("tag", help="Run controlled LLM document tagging calibration")
     tag_parser.add_argument("--data", default="data", help="Data directory with parsed artifacts")
     tag_parser.add_argument("--limit", type=_positive_int, default=100, help="Limit documents for calibration")
-    tag_parser.add_argument("--model", default=PRIMARY_TAGGING_MODEL, help="Stable OpenRouter model id")
+    tag_parser.add_argument("--model", default=OPENROUTER_DEEPSEEK_FLASH, help="Stable OpenRouter legacy model id")
     tag_parser.add_argument("--primary-model", default=None, help="Alias for --model in Gemini/hybrid commands")
     tag_parser.add_argument("--model-preset", choices=("deepseek-flash", "gemini-flash"), default=None)
     tag_parser.add_argument("--fallback-model", default="none", help="Stable fallback OpenRouter model id, or none")
@@ -82,29 +92,41 @@ def build_parser() -> argparse.ArgumentParser:
     tag_batch_parser = subparsers.add_parser("tag-batch", help="Run active-only batch LLM document tagging calibration")
     tag_batch_parser.add_argument("--data", default="data", help="Data directory with parsed artifacts")
     tag_batch_parser.add_argument("--limit", type=_positive_int, default=100, help="Limit documents for calibration")
+    tag_batch_parser.add_argument("--provider", choices=("gemini_direct", "openrouter"), default="gemini_direct")
     tag_batch_parser.add_argument("--batch-size", type=_positive_int, default=5)
     tag_batch_parser.add_argument("--batch-char-limit", type=_positive_int, default=50000)
     tag_batch_parser.add_argument("--prompt-char-limit-per-doc", type=_positive_int, default=16000)
-    tag_batch_parser.add_argument("--model", default=GEMINI_FLASH_TAGGING_MODEL, help="Stable OpenRouter model id")
+    tag_batch_parser.add_argument("--model", default=GEMINI_FLASH_TAGGING_MODEL, help="Stable model id for selected provider")
     tag_batch_parser.add_argument("--primary-model", default=None, help="Alias for --model in Gemini/hybrid commands")
+    tag_batch_parser.add_argument("--model-role", choices=tuple(sorted(MODEL_ROLE_MAPPING)), default=None)
     tag_batch_parser.add_argument("--model-preset", choices=("deepseek-flash", "gemini-flash"), default=None)
     tag_batch_parser.add_argument("--fallback-model", default="none", help="Stable fallback OpenRouter model id, or none")
     tag_batch_parser.add_argument("--max-cost-usd", type=_non_negative_float, default=5.0, help="Hard calibration budget limit")
     tag_batch_parser.add_argument("--max-retries", type=_non_negative_int, default=3, help="Retries per batch/model")
     tag_batch_parser.add_argument("--max-output-tokens", type=_positive_int, default=6000)
     tag_batch_parser.add_argument("--provider-sort", choices=("throughput", "price"), default="throughput")
-    tag_batch_parser.add_argument("--timeout-seconds", type=_positive_int, default=300)
+    tag_batch_parser.add_argument("--timeout-seconds", type=_non_negative_int, default=0, help="0 disables urllib timeout")
     tag_batch_parser.add_argument("--max-inflight", type=_positive_int, default=1)
     tag_batch_parser.add_argument("--min-request-interval-seconds", type=_non_negative_float, default=5.0)
     tag_batch_parser.add_argument("--rate-limit-backoff-seconds", type=_non_negative_float, default=120.0)
     tag_batch_parser.add_argument("--max-rate-limit-backoff-seconds", type=_non_negative_float, default=300.0)
     tag_batch_parser.add_argument("--retry-failures", action="store_true", help="Resume successes but retry previous failures")
     tag_batch_parser.add_argument("--experiment-name", default=None, help="Write isolated outputs under data/experiments/{name}")
-    tag_batch_parser.add_argument("--structured-output-mode", choices=("strict", "schema_lite", "prompt_json"), default="strict")
+    tag_batch_parser.add_argument(
+        "--structured-output-mode",
+        choices=("strict", "schema_lite", "prompt_json", "gemini_schema", "gemini_schema_lite"),
+        default="gemini_schema",
+    )
     tag_batch_parser.add_argument("--schema-version", choices=("document_tagging_v2", "compact_tagging_v2"), default="document_tagging_v2")
-    tag_batch_parser.add_argument("--prompt-version", choices=("tagging_v2", "tagging_v2_compact"), default="tagging_v2")
+    tag_batch_parser.add_argument(
+        "--prompt-version",
+        choices=("tagging_v2", "tagging_v2_compact", "tagging_v2_gemini"),
+        default="tagging_v2_gemini",
+    )
     tag_batch_parser.add_argument("--tagging-text-mode", choices=("full", "compact"), default="full")
     tag_batch_parser.add_argument("--tagging-char-limit", type=_positive_int, default=8000)
+    tag_batch_parser.add_argument("--thinking-level", choices=("minimal", "low", "medium", "high"), default=None)
+    tag_batch_parser.add_argument("--thinking-budget", type=int, default=None)
     tag_batch_parser.add_argument("--routing-strategy", choices=("single", "manual_fallback", "openrouter_models"), default="single")
     tag_batch_parser.add_argument("--fallback-on-status", default="429")
     tag_batch_parser.add_argument("--primary-max-retries", type=_non_negative_int, default=None)
@@ -115,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
     tag_batch_parser.add_argument("--use-api-key-list", action="store_true", help="Rotate keys from OPENROUTER_API_KEY_LIST")
     tag_batch_parser.add_argument("--no-resume", action="store_true", help="Do not skip already written active records")
     tag_batch_parser.set_defaults(func=run_tag_batch)
+
+    gemini_models_parser = subparsers.add_parser("gemini-list-models", help="Discover direct Gemini models")
+    gemini_models_parser.add_argument("--data", default="data", help="Data directory for report artifacts")
+    gemini_models_parser.add_argument("--timeout-seconds", type=_non_negative_int, default=0, help="0 disables urllib timeout")
+    gemini_models_parser.set_defaults(func=run_gemini_list_models)
 
     return parser
 
@@ -316,9 +343,10 @@ def run_tag_batch(args: argparse.Namespace) -> int:
     logger = configure_logging(data_dir)
     logger.info("batch tagging calibration started")
     logger.info(
-        "data_dir=%s limit=%s batch_size=%s model=%s fallback_model=%s max_cost_usd=%s experiment=%s mode=%s",
+        "data_dir=%s limit=%s provider=%s batch_size=%s model=%s fallback_model=%s max_cost_usd=%s experiment=%s mode=%s",
         data_dir,
         args.limit,
+        args.provider,
         args.batch_size,
         args.model,
         args.fallback_model,
@@ -327,12 +355,27 @@ def run_tag_batch(args: argparse.Namespace) -> int:
         args.structured_output_mode,
     )
 
-    load_dotenv_openrouter_key(Path(".env"))
+    if args.provider == "gemini_direct":
+        load_dotenv_gemini_keys(Path(".env"))
+    else:
+        load_dotenv_openrouter_key(Path(".env"))
     model = model_from_preset(args.model_preset, args.primary_model or args.model)
+    model = model_from_role(args.model_role, model)
+    structured_output_mode = args.structured_output_mode
+    prompt_version = args.prompt_version
+    if args.provider == "openrouter":
+        if model == GEMINI_FLASH_TAGGING_MODEL:
+            model = OPENROUTER_GEMINI_FLASH_TAGGING_MODEL
+        if structured_output_mode in {"gemini_schema", "gemini_schema_lite"}:
+            structured_output_mode = "strict"
+        if prompt_version == "tagging_v2_gemini":
+            prompt_version = "tagging_v2"
     config = BatchTaggingConfig(
         data_dir=data_dir,
         limit=args.limit,
+        provider=args.provider,
         model=model,
+        model_role=args.model_role,
         fallback_model=_parse_optional_model(args.fallback_model),
         max_cost_usd=args.max_cost_usd,
         max_retries=args.max_retries,
@@ -347,20 +390,30 @@ def run_tag_batch(args: argparse.Namespace) -> int:
         min_request_interval_seconds=args.min_request_interval_seconds,
         rate_limit_backoff_seconds=args.rate_limit_backoff_seconds,
         max_rate_limit_backoff_seconds=args.max_rate_limit_backoff_seconds,
-        structured_output_mode=args.structured_output_mode,
+        structured_output_mode=structured_output_mode,
         experiment_name=args.experiment_name,
-        prompt_version=args.prompt_version,
+        prompt_version=prompt_version,
         output_schema_version=args.schema_version,
         tagging_text_mode=args.tagging_text_mode,
         tagging_char_limit=args.tagging_char_limit,
+        thinking_level=args.thinking_level,
+        thinking_budget=args.thinking_budget,
     )
     try:
-        client = OpenRouterClient(
-            timeout_seconds=args.timeout_seconds,
-            use_api_key_list=args.use_api_key_list,
-        )
-        if args.use_api_key_list:
-            logger.info("OpenRouter key rotation enabled key_count=%s", client.api_keys_count)
+        if args.provider == "gemini_direct":
+            client = GeminiClient(
+                timeout_seconds=_optional_timeout_seconds(args.timeout_seconds),
+                rate_limit_backoff_seconds=args.rate_limit_backoff_seconds,
+                max_rate_limit_backoff_seconds=args.max_rate_limit_backoff_seconds,
+            )
+            logger.info("Gemini direct key rotation enabled key_count=%s", client.api_keys_count)
+        else:
+            client = OpenRouterClient(
+                timeout_seconds=args.timeout_seconds,
+                use_api_key_list=args.use_api_key_list,
+            )
+            if args.use_api_key_list:
+                logger.info("OpenRouter key rotation enabled key_count=%s", client.api_keys_count)
         report = run_batch_tagging_calibration(
             config=config,
             client=client,
@@ -389,6 +442,38 @@ def run_tag_batch(args: argparse.Namespace) -> int:
     )
     if report.get("stop_reason"):
         print(f"Stopped: {report['stop_reason']}")
+    return 0
+
+
+def run_gemini_list_models(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data)
+    logger = configure_logging(data_dir)
+    logger.info("Gemini model discovery started")
+    load_dotenv_gemini_keys(Path(".env"))
+    client = GeminiClient(timeout_seconds=_optional_timeout_seconds(args.timeout_seconds))
+    try:
+        raw = client.list_models()
+    except GeminiError as exc:
+        logger.exception("Gemini model discovery failed")
+        print(f"Gemini model discovery failed: {exc}")
+        return 1
+
+    reports_dir = data_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = reports_dir / "gemini_models.json"
+    with raw_path.open("w", encoding="utf-8") as fh:
+        json.dump(raw, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+
+    docs_dir = Path("docs")
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    markdown_path = docs_dir / "gemini_available_models.md"
+    markdown_path.write_text(_gemini_models_markdown(raw, client), encoding="utf-8")
+
+    models = raw.get("models", [])
+    models_count = len(models) if isinstance(models, list) else 0
+    logger.info("Gemini model discovery finished models=%s raw=%s markdown=%s", models_count, raw_path, markdown_path)
+    print(f"Gemini model discovery complete: models={models_count} raw={raw_path} report={markdown_path}")
     return 0
 
 
@@ -432,6 +517,10 @@ def _non_negative_float(value: str) -> float:
     return parsed
 
 
+def _optional_timeout_seconds(value: int) -> int | None:
+    return None if value == 0 else value
+
+
 def _parse_optional_model(value: str | None) -> str | None:
     if value is None:
         return None
@@ -439,3 +528,85 @@ def _parse_optional_model(value: str | None) -> str | None:
     if not stripped or stripped.lower() in {"none", "null", "off"}:
         return None
     return stripped
+
+
+def _gemini_models_markdown(raw: dict[str, Any], client: GeminiClient) -> str:
+    models = raw.get("models", [])
+    if not isinstance(models, list):
+        models = []
+    lines = [
+        "# Gemini Available Models",
+        "",
+        f"Generated at: {__import__('datetime').datetime.utcnow().isoformat(timespec='seconds')}Z",
+        "",
+        "## Recommended mapping",
+        "",
+        "TAGGING_PRIMARY = gemini-3-flash-preview",
+        "EVIDENCE_EXTRACTION_PRIMARY = gemini-3-flash-preview",
+        "TAG_NORMALIZATION_PRIMARY = gemini-3-pro-preview",
+        "ARTICLE_COMPILATION_PRIMARY = gemini-3-pro-preview",
+        "FOLDER_HIERARCHY_PRIMARY = gemini-3-flash-preview",
+        "QA_AUDIT_PRIMARY = gemini-3-flash-preview",
+        "",
+        f"Discovered with key_count={client.api_keys_count}; keys are not stored in this report.",
+        "",
+        "## Raw available models",
+        "",
+        "| name | baseModelId | version | displayName | input | output | methods | recommended_role |",
+        "|---|---|---|---|---:|---:|---|---|",
+    ]
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", ""))
+        base_model_id = str(item.get("baseModelId", ""))
+        version = str(item.get("version", ""))
+        display_name = str(item.get("displayName", ""))
+        input_limit = item.get("inputTokenLimit", "")
+        output_limit = item.get("outputTokenLimit", "")
+        methods = item.get("supportedGenerationMethods", [])
+        methods_text = ", ".join(str(method) for method in methods) if isinstance(methods, list) else ""
+        role = _recommended_gemini_role(item)
+        lines.append(
+            "| "
+            + " | ".join(
+                _md_cell(value)
+                for value in (
+                    name,
+                    base_model_id,
+                    version,
+                    display_name,
+                    input_limit,
+                    output_limit,
+                    methods_text,
+                    role,
+                )
+            )
+            + " |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _recommended_gemini_role(model: dict[str, Any]) -> str:
+    model_id = str(model.get("baseModelId") or model.get("name") or "").removeprefix("models/")
+    methods = model.get("supportedGenerationMethods", [])
+    supports_generate = isinstance(methods, list) and "generateContent" in methods
+    if not supports_generate:
+        return "not_for_pipeline"
+    if model_id == "gemini-3-flash-preview":
+        return "TAGGING_PRIMARY,EVIDENCE_EXTRACTION_PRIMARY,FOLDER_HIERARCHY_PRIMARY,QA_AUDIT_PRIMARY"
+    if model_id == "gemini-3-pro-preview":
+        return "TAG_NORMALIZATION_PRIMARY,ARTICLE_COMPILATION_PRIMARY,QA_AUDIT_HARD"
+    if model_id == "gemini-2.5-flash-lite":
+        return "cheap_fallback_candidate"
+    if model_id == "gemini-2.5-pro":
+        return "stable_pro_fallback_candidate"
+    if model_id == "gemini-2.0-flash":
+        return "stable_flash_fallback_candidate"
+    return "available_generateContent_candidate"
+
+
+def _md_cell(value: Any) -> str:
+    text = str(value)
+    return text.replace("|", "\\|").replace("\n", " ")

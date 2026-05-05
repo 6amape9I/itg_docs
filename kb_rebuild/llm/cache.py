@@ -36,6 +36,7 @@ class LLMCache:
 
 def build_cache_key(
     *,
+    provider: str = "openrouter",
     model: str,
     prompt_version: str,
     schema_version: str,
@@ -44,6 +45,7 @@ def build_cache_key(
     request_params: dict[str, Any],
 ) -> str:
     payload = {
+        "provider": provider,
         "model": model,
         "prompt_version": prompt_version,
         "schema_version": schema_version,
@@ -57,4 +59,3 @@ def build_cache_key(
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-

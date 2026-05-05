@@ -12,6 +12,14 @@ from unittest.mock import patch
 from kb_rebuild.io.jsonl import read_jsonl, write_jsonl
 from kb_rebuild.cli import _parse_optional_model
 from kb_rebuild.llm.cache import build_cache_key
+from kb_rebuild.llm.gemini_client import (
+    GeminiClient,
+    GeminiCompletion,
+    GeminiError,
+    parse_gemini_key_list,
+)
+from kb_rebuild.llm.gemini_schema import schema_for_gemini
+from kb_rebuild.llm.models import validate_direct_gemini_model_id
 from kb_rebuild.llm.openrouter_client import (
     OpenRouterClient,
     OpenRouterCompletion,
@@ -168,6 +176,91 @@ class FakeBatchClient:
         )
 
 
+class FakeGeminiBatchClient:
+    provider_name = "gemini_direct"
+
+    def __init__(self, entity_type: str = "disease", fail_on_call: bool = False) -> None:
+        self.entity_type = entity_type
+        self.fail_on_call = fail_on_call
+        self.calls = 0
+        self.payloads: list[dict[str, Any]] = []
+
+    @property
+    def api_keys_count(self) -> int:
+        return 1
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "key_stats": {
+                "0": {
+                    "requests": self.calls,
+                    "success": self.calls,
+                    "errors": 0,
+                    "http_429": 0,
+                    "cooldown_events": 0,
+                    "disabled": False,
+                }
+            }
+        }
+
+    def chat_completion(self, payload: dict[str, Any]) -> GeminiCompletion:
+        self.calls += 1
+        self.payloads.append(payload)
+        if self.fail_on_call:
+            raise AssertionError("Gemini client must not be called")
+        content_text = str(payload["contents"][0]["parts"][0]["text"])
+        doc_ids = _extract_doc_ids_from_batch_message(content_text)
+        content = json.dumps(
+            {
+                "documents": [
+                    {
+                        "doc_id": doc_id,
+                        "entities": [
+                            {
+                                "surface": "гастрит",
+                                "canonical_candidate_ru": "Гастрит",
+                                "canonical_candidate_latin": "Gastritis",
+                                "entity_type": self.entity_type,
+                                "article_candidate": True,
+                                "tag_role": "article_candidate",
+                                "is_primary": True,
+                                "confidence": 0.94,
+                                "evidence_quotes": [
+                                    "Гастрит является воспалением слизистой оболочки желудка"
+                                ],
+                                "comment": "Документ посвящён гастриту",
+                            }
+                        ],
+                    }
+                    for doc_id in doc_ids
+                ]
+            },
+            ensure_ascii=False,
+        )
+        return GeminiCompletion(
+            raw={
+                "modelVersion": f"models/{payload['model']}",
+                "candidates": [{"content": {"parts": [{"text": content}]}, "finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 50},
+            },
+            content=content,
+            usage={"prompt_tokens": 100, "completion_tokens": 50, "reasoning_tokens": 0},
+            model=f"models/{payload['model']}",
+            finish_reason="STOP",
+            latency_ms=12,
+            api_key_index=0,
+            usage_source="api",
+        )
+
+
+class FlakyGeminiBatchClient(FakeGeminiBatchClient):
+    def chat_completion(self, payload: dict[str, Any]) -> GeminiCompletion:
+        if self.calls == 0:
+            self.calls += 1
+            raise GeminiError("Gemini HTTP 429 on key_index=0", status_code=429, api_key_index=0)
+        return super().chat_completion(payload)
+
+
 class LLMOrchestratorContractTests(unittest.TestCase):
     def test_cache_key_is_stable(self) -> None:
         params = {
@@ -194,8 +287,34 @@ class LLMOrchestratorContractTests(unittest.TestCase):
         )
         self.assertEqual(key1, key2)
 
+    def test_cache_key_distinguishes_provider(self) -> None:
+        params = {"temperature": 0, "max_tokens": 1600}
+        openrouter_key = build_cache_key(
+            provider="openrouter",
+            model="google/gemini-3-flash-preview",
+            prompt_version="tagging_v2",
+            schema_version="document_tagging_batch_v2",
+            doc_id="batch:doc_1",
+            input_hash="abc",
+            request_params=params,
+        )
+        gemini_key = build_cache_key(
+            provider="gemini_direct",
+            model="gemini-3-flash-preview",
+            prompt_version="tagging_v2_gemini",
+            schema_version="document_tagging_batch_v2",
+            doc_id="batch:doc_1",
+            input_hash="abc",
+            request_params=params,
+        )
+        self.assertNotEqual(openrouter_key, gemini_key)
+
     def test_api_key_list_parser_accepts_common_separators(self) -> None:
         self.assertEqual(parse_api_key_list("k1,k2; k3\\nk4,k2"), ["k1", "k2", "k3", "k4"])
+
+    def test_gemini_key_list_parser_accepts_supported_formats(self) -> None:
+        self.assertEqual(parse_gemini_key_list("k1,k2; k3\\nk4,k2"), ["k1", "k2", "k3", "k4"])
+        self.assertEqual(parse_gemini_key_list('["k1", "k2", "k1"]'), ["k1", "k2"])
 
     def test_openrouter_client_rotates_api_keys(self) -> None:
         client = OpenRouterClient(api_keys=["k1", "k2"])
@@ -302,6 +421,14 @@ class LLMOrchestratorContractTests(unittest.TestCase):
             {"doc_000001_a1b2c3d4"},
         )
         self.assertEqual(errors, [])
+
+    def test_gemini_schema_removes_openrouter_and_strict_keywords(self) -> None:
+        gemini_schema = schema_for_gemini(load_document_tagging_batch_v2_schema(), lite=True)
+        serialized = json.dumps(gemini_schema, ensure_ascii=False)
+        self.assertNotIn("$schema", serialized)
+        self.assertNotIn("schema_version", serialized)
+        self.assertNotIn("additionalProperties", serialized)
+        self.assertIn("documents", serialized)
 
     def test_batch_validator_rejects_extra_doc_id(self) -> None:
         schema = load_document_tagging_batch_v2_schema()
@@ -528,6 +655,95 @@ class LLMOrchestratorContractTests(unittest.TestCase):
             )
             self.assertFalse((data_dir / "tagging" / "document_tags_raw_active.jsonl").exists())
 
+    def test_gemini_direct_batch_uses_gemini_payload_and_local_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_parsed_fixture(data_dir)
+            client = FakeGeminiBatchClient()
+            report = run_batch_tagging_calibration(
+                _gemini_batch_config(data_dir),
+                client=client,
+            )
+            self.assertEqual(report["provider"], "gemini_direct")
+            self.assertEqual(report["documents_tagged"], 1)
+            self.assertEqual(client.calls, 1)
+            payload = client.payloads[0]
+            self.assertNotIn("messages", payload)
+            self.assertNotIn("response_format", payload)
+            self.assertEqual(payload["model"], "gemini-3-flash-preview")
+            self.assertEqual(payload["generationConfig"]["responseMimeType"], "application/json")
+            self.assertIn("responseJsonSchema", payload["generationConfig"])
+            self.assertEqual(payload["generationConfig"]["thinkingConfig"], {"thinkingLevel": "minimal"})
+
+    def test_direct_gemini_model_id_rejects_openrouter_prefix(self) -> None:
+        validate_direct_gemini_model_id("gemini-3-flash-preview")
+        with self.assertRaises(ValueError):
+            validate_direct_gemini_model_id("google/gemini-3-flash-preview")
+
+    def test_gemini_key_aware_cooldown_only_skips_limited_key(self) -> None:
+        now = [0.0]
+        sleeps: list[float] = []
+        client = GeminiClient(
+            api_keys=["k1", "k2"],
+            rate_limit_backoff_seconds=10,
+            max_rate_limit_backoff_seconds=30,
+            time_fn=lambda: now[0],
+            sleep_fn=lambda seconds: sleeps.append(seconds),
+        )
+        client.notify_http_error(key_index=0, status_code=429, response_headers={"Retry-After": "20"})
+        self.assertEqual(client._select_key_index(), 1)
+        snapshot = client.snapshot()
+        self.assertEqual(snapshot["key_stats"]["0"]["http_429"], 1)
+        self.assertEqual(snapshot["key_stats"]["0"]["cooldown_events"], 1)
+
+    def test_gemini_key_aware_403_disables_one_key(self) -> None:
+        client = GeminiClient(api_keys=["k1", "k2"])
+        client.notify_http_error(key_index=0, status_code=403)
+        self.assertEqual(client._select_key_index(), 1)
+        self.assertTrue(client.snapshot()["key_stats"]["0"]["disabled"])
+
+    def test_gemini_direct_retries_429_and_succeeds_on_next_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_parsed_fixture(data_dir)
+            client = FlakyGeminiBatchClient()
+            report = run_batch_tagging_calibration(
+                _gemini_batch_config(data_dir, max_retries=1),
+                client=client,
+            )
+            self.assertEqual(report["documents_tagged"], 1)
+            self.assertEqual(report["http_429_count"], 1)
+            self.assertEqual(report["llm_retries_count"], 1)
+
+    def test_empty_clean_text_is_not_sent_to_gemini_and_writes_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_empty_parsed_fixture(data_dir)
+            client = FakeGeminiBatchClient(fail_on_call=True)
+            report = run_batch_tagging_calibration(
+                _gemini_batch_config(data_dir, experiment_name="gemini_empty"),
+                client=client,
+            )
+            self.assertEqual(report["documents_tagged"], 0)
+            self.assertEqual(report["documents_failed"], 1)
+            self.assertEqual(client.calls, 0)
+            candidates = read_jsonl(
+                data_dir / "tagging" / "experiments" / "gemini_empty" / "empty_documents_name_candidates.jsonl"
+            )
+            self.assertEqual(candidates[0]["reason"], "empty_clean_text")
+
+    def test_gemini_direct_invalid_batch_fails_local_schema_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            _write_parsed_fixture(data_dir)
+            report = run_batch_tagging_calibration(
+                _gemini_batch_config(data_dir, max_retries=0),
+                client=FakeGeminiBatchClient(entity_type="bad_type"),
+            )
+            self.assertEqual(report["documents_tagged"], 0)
+            self.assertEqual(report["documents_failed"], 1)
+            self.assertEqual(report["invalid_json_count"], 1)
+
     def test_rate_limiter_enforces_start_interval(self) -> None:
         now = [0.0]
         sleeps: list[float] = []
@@ -627,6 +843,35 @@ def _batch_config(
     )
 
 
+def _gemini_batch_config(
+    data_dir: Path,
+    *,
+    max_retries: int = 0,
+    experiment_name: str | None = None,
+) -> BatchTaggingConfig:
+    return BatchTaggingConfig(
+        data_dir=data_dir,
+        limit=1,
+        provider="gemini_direct",
+        model="gemini-3-flash-preview",
+        fallback_model=None,
+        max_cost_usd=5,
+        max_retries=max_retries,
+        batch_size=5,
+        batch_char_limit=50000,
+        prompt_char_limit_per_doc=16000,
+        max_output_tokens=6000,
+        max_inflight=1,
+        min_request_interval_seconds=0,
+        rate_limit_backoff_seconds=0,
+        max_rate_limit_backoff_seconds=0,
+        resume=False,
+        experiment_name=experiment_name,
+        structured_output_mode="gemini_schema",
+        prompt_version="tagging_v2_gemini",
+    )
+
+
 def _write_parsed_fixture(data_dir: Path) -> None:
     write_jsonl(
         data_dir / "parsed" / "parsed_documents.jsonl",
@@ -644,6 +889,28 @@ def _write_parsed_fixture(data_dir: Path) -> None:
                 "blocks_count": 1,
                 "non_empty_blocks_count": 1,
                 "block_types": {"paragraph": 1},
+            }
+        ],
+    )
+
+
+def _write_empty_parsed_fixture(data_dir: Path) -> None:
+    write_jsonl(
+        data_dir / "parsed" / "parsed_documents.jsonl",
+        [
+            {
+                "doc_id": "doc_000001_empty",
+                "row_index": 1,
+                "name": "Пустой документ",
+                "description": "",
+                "content_hash": "hash",
+                "parse_status": "ok",
+                "parse_errors": [],
+                "clean_text": "",
+                "text_length_chars": 0,
+                "blocks_count": 0,
+                "non_empty_blocks_count": 0,
+                "block_types": {},
             }
         ],
     )

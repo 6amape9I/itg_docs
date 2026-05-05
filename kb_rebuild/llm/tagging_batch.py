@@ -13,12 +13,23 @@ from typing import Any
 from kb_rebuild.io.jsonl import read_jsonl, write_jsonl
 from kb_rebuild.llm.cache import LLMCache, build_cache_key, sha256_text
 from kb_rebuild.llm.models import (
+    GEMINI_3_FLASH_PREVIEW,
     PRIMARY_TAGGING_MODEL,
     calculate_cost_usd,
     estimate_request_cost_usd,
+    validate_direct_gemini_model_id,
     validate_model_id,
 )
+from kb_rebuild.llm.gemini_client import GeminiClient, GeminiError
+from kb_rebuild.llm.gemini_schema import schema_for_gemini
 from kb_rebuild.llm.openrouter_client import OpenRouterClient, OpenRouterCompletion, OpenRouterError
+from kb_rebuild.llm.providers import (
+    client_key_stats,
+    client_keys_count,
+    client_provider_name,
+    completion_api_key_index,
+    completion_usage_source,
+)
 from kb_rebuild.llm.rate_limiter import AdaptiveRateLimiter
 from kb_rebuild.llm.schema_validation import (
     expand_compact_batch_response,
@@ -39,17 +50,21 @@ from kb_rebuild.llm.tagging import (
 
 
 PROMPT_VERSION_V2 = "tagging_v2"
+PROMPT_VERSION_GEMINI = "tagging_v2_gemini"
 DEFAULT_BATCH_SIZE = 5
 DEFAULT_BATCH_CHAR_LIMIT = 50_000
 DEFAULT_PROMPT_CHAR_LIMIT_PER_DOC = 16_000
 DEFAULT_MAX_OUTPUT_TOKENS = 6_000
+FULL_CORPUS_DOCUMENTS_ESTIMATE = 16_181
 
 
 @dataclass(frozen=True)
 class BatchTaggingConfig:
     data_dir: Path
     limit: int | None = 100
+    provider: str = "openrouter"
     model: str = PRIMARY_TAGGING_MODEL
+    model_role: str | None = None
     fallback_model: str | None = None
     max_cost_usd: float = 5.0
     max_retries: int = 3
@@ -71,6 +86,8 @@ class BatchTaggingConfig:
     output_schema_version: str = "document_tagging_v2"
     tagging_text_mode: str = "full"
     tagging_char_limit: int = 8000
+    thinking_level: str | None = None
+    thinking_budget: int | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +101,7 @@ class OutputPaths:
     manifest_path: Path
     report_path: Path
     alias_success_path: Path | None
+    empty_documents_candidates_path: Path
 
 
 class BatchTaggingRunner:
@@ -213,10 +231,16 @@ class BatchTaggingRunner:
 
         active_success_records = list(active_success_by_doc.values())
         active_failure_records = list(active_failure_by_doc.values())
+        empty_document_candidates = [
+            _empty_document_candidate(record)
+            for record in active_failure_records
+            if record.get("failure_reason") == "empty_clean_text"
+        ]
         write_jsonl(self.paths.active_success_path, active_success_records)
         write_jsonl(self.paths.history_success_path, success_history)
         write_jsonl(self.paths.active_failures_path, active_failure_records)
         write_jsonl(self.paths.history_failures_path, failure_history)
+        write_jsonl(self.paths.empty_documents_candidates_path, empty_document_candidates)
         if self.paths.alias_success_path is not None:
             write_jsonl(self.paths.alias_success_path, active_success_records)
 
@@ -314,6 +338,8 @@ class BatchTaggingRunner:
                     model=str(result["model"]),
                     requested_model=str(result["requested_model"]),
                     usage=result["usage"],
+                    api_key_index=result.get("api_key_index"),
+                    usage_source=str(result.get("usage_source") or "api"),
                     estimated_cost_usd=float(result["estimated_cost_usd"]) / max(1, len(documents)),
                     latency_ms=int(result["latency_ms"]),
                     finish_reason=str(result["finish_reason"]),
@@ -386,6 +412,8 @@ class BatchTaggingRunner:
                             "model": str(cached.get("model") or model),
                             "requested_model": model,
                             "usage": _safe_usage(cached.get("usage")),
+                            "api_key_index": _optional_int(cached.get("api_key_index")),
+                            "usage_source": str(cached.get("usage_source") or "api"),
                             "estimated_cost_usd": float(cached.get("estimated_cost_usd") or 0.0),
                             "latency_ms": int(cached.get("latency_ms") or 0),
                             "finish_reason": str(cached.get("finish_reason") or ""),
@@ -428,7 +456,7 @@ class BatchTaggingRunner:
                     with self.rate_limiter.acquire():
                         completion = self.client.chat_completion(context["payload"])
                     self.rate_limiter.notify_success()
-                except OpenRouterError as exc:
+                except (OpenRouterError, GeminiError) as exc:
                     attempts += 0
                     self.stats["llm_error_count"] += 1
                     self._record_http_error(exc)
@@ -480,6 +508,8 @@ class BatchTaggingRunner:
                         "model": completion.model or model,
                         "requested_model": model,
                         "usage": completion.usage,
+                        "api_key_index": completion_api_key_index(completion),
+                        "usage_source": completion_usage_source(completion),
                         "estimated_cost_usd": cost_usd,
                         "latency_ms": completion.latency_ms,
                         "finish_reason": completion.finish_reason,
@@ -523,34 +553,66 @@ class BatchTaggingRunner:
                 "\n\nПредыдущий batch-ответ был невалиден. Исправь ответ: верни строго один JSON-объект "
                 "с массивом documents, без markdown, без лишних полей, с теми же DOC_ID."
             )
-        messages = [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": user_message},
-        ]
-        provider = {"require_parameters": True, "sort": self.config.provider_sort}
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_output_tokens,
-            "provider": provider,
-        }
-        if self.config.structured_output_mode in {"strict", "schema_lite"}:
-            openrouter_schema = (
-                schema_for_openrouter_lite(self.batch_schema)
-                if self.config.structured_output_mode == "schema_lite"
-                else schema_for_openrouter(self.batch_schema)
-            )
-            payload["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "document_tagging_batch",
-                    "strict": True,
-                    "schema": openrouter_schema,
-                },
+        provider_params: dict[str, Any] = {"require_parameters": True, "sort": self.config.provider_sort}
+        if self.config.provider == "gemini_direct":
+            full_prompt = f"{system_message}\n\n{user_message}"
+            generation_config: dict[str, Any] = {
+                "temperature": self.config.temperature,
+                "maxOutputTokens": self.config.max_output_tokens,
+                "responseMimeType": "application/json",
             }
-
-        prompt_chars = sum(len(str(message.get("content", ""))) for message in messages)
+            thinking_config = _gemini_thinking_config(
+                model=model,
+                thinking_level=self.config.thinking_level,
+                thinking_budget=self.config.thinking_budget,
+            )
+            if thinking_config:
+                generation_config["thinkingConfig"] = thinking_config
+            if self.config.structured_output_mode in {"gemini_schema", "gemini_schema_lite"}:
+                generation_config["responseJsonSchema"] = schema_for_gemini(
+                    self.batch_schema,
+                    lite=self.config.structured_output_mode == "gemini_schema_lite",
+                )
+            payload = {
+                "model": model,
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": full_prompt}],
+                    }
+                ],
+                "generationConfig": generation_config,
+            }
+            prompt_chars = len(full_prompt)
+            payload_shape = "gemini_generate_content"
+        else:
+            messages = [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message},
+            ]
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": self.config.temperature,
+                "max_tokens": self.config.max_output_tokens,
+                "provider": provider_params,
+            }
+            if self.config.structured_output_mode in {"strict", "schema_lite"}:
+                openrouter_schema = (
+                    schema_for_openrouter_lite(self.batch_schema)
+                    if self.config.structured_output_mode == "schema_lite"
+                    else schema_for_openrouter(self.batch_schema)
+                )
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "document_tagging_batch",
+                        "strict": True,
+                        "schema": openrouter_schema,
+                    },
+                }
+            prompt_chars = sum(len(str(message.get("content", ""))) for message in messages)
+            payload_shape = "openrouter_chat_completion"
         input_hash = sha256_text(
             json.dumps(
                 {
@@ -558,6 +620,7 @@ class BatchTaggingRunner:
                     "structured_output_mode": self.config.structured_output_mode,
                     "output_schema_version": self.config.output_schema_version,
                     "prompt_version": self.config.prompt_version,
+                    "system_prompt_hash": sha256_text(system_message),
                     "tagging_text_mode": self.config.tagging_text_mode,
                     "tagging_char_limit": self.config.tagging_char_limit,
                 },
@@ -566,9 +629,10 @@ class BatchTaggingRunner:
             )
         )
         request_params = {
+            "provider": self.config.provider,
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_output_tokens,
-            "provider": provider,
+            "provider_params": provider_params if self.config.provider == "openrouter" else None,
             "batch_size": len(documents),
             "batch_char_limit": self.config.batch_char_limit,
             "prompt_char_limit_per_doc": self.config.prompt_char_limit_per_doc,
@@ -578,10 +642,16 @@ class BatchTaggingRunner:
             "experiment_name": self.config.experiment_name,
             "output_schema_version": self.config.output_schema_version,
             "prompt_version": self.config.prompt_version,
+            "system_prompt_hash": sha256_text(system_message),
             "tagging_text_mode": self.config.tagging_text_mode,
             "tagging_char_limit": self.config.tagging_char_limit,
+            "thinking_level": self.config.thinking_level,
+            "thinking_budget": self.config.thinking_budget,
+            "payload_shape": payload_shape,
+            "model_role": self.config.model_role,
         }
         cache_key = build_cache_key(
+            provider=self.config.provider,
             model=model,
             prompt_version=self.config.prompt_version,
             schema_version=self.schema_version,
@@ -606,6 +676,8 @@ class BatchTaggingRunner:
         model: str,
         requested_model: str,
         usage: dict[str, int],
+        api_key_index: int | None,
+        usage_source: str,
         estimated_cost_usd: float,
         latency_ms: int,
         finish_reason: str,
@@ -630,6 +702,8 @@ class BatchTaggingRunner:
             "document_name": str(document.get("name", "")),
             "model": model,
             "requested_model": requested_model,
+            "provider": self.config.provider,
+            "model_role": self.config.model_role,
             "prompt_version": self.config.prompt_version,
             "schema_version": "document_tagging_v2",
             "raw_schema_version": self.config.output_schema_version,
@@ -642,6 +716,8 @@ class BatchTaggingRunner:
             "cache_key": cache_key,
             "from_cache": from_cache,
             "usage": usage,
+            "usage_source": usage_source,
+            "api_key_index": api_key_index,
             "estimated_cost_usd": round(estimated_cost_usd, 8),
             "latency_ms": latency_ms,
             "finish_reason": finish_reason,
@@ -662,6 +738,8 @@ class BatchTaggingRunner:
             "document_name": str(document.get("name", "")),
             "model": self.config.model,
             "requested_model": self.config.model,
+            "provider": self.config.provider,
+            "model_role": self.config.model_role,
             "prompt_version": self.config.prompt_version,
             "schema_version": "document_tagging_v2",
             "raw_schema_version": self.config.output_schema_version,
@@ -685,7 +763,7 @@ class BatchTaggingRunner:
         self,
         *,
         context: dict[str, Any],
-        completion: OpenRouterCompletion,
+        completion: OpenRouterCompletion | Any,
         parsed: dict[str, Any] | None,
         validation_errors: list[str],
         cost_usd: float,
@@ -694,7 +772,10 @@ class BatchTaggingRunner:
         return {
             "cache_key": context["cache_key"],
             "created_at": utc_now(),
+            "provider": self.config.provider,
             "model": completion.model,
+            "model_requested": self.config.model,
+            "model_actual": completion.model,
             "prompt_version": self.config.prompt_version,
             "schema_version": self.schema_version,
             "input_hash": context["input_hash"],
@@ -706,6 +787,8 @@ class BatchTaggingRunner:
             "response_raw": completion.raw,
             "response_parsed": parsed,
             "usage": completion.usage,
+            "usage_source": completion_usage_source(completion),
+            "api_key_index": completion_api_key_index(completion),
             "estimated_cost_usd": cost_usd,
             "latency_ms": completion.latency_ms,
             "finish_reason": completion.finish_reason,
@@ -713,11 +796,14 @@ class BatchTaggingRunner:
             "validation_errors": validation_errors,
         }
 
-    def _write_error_cache(self, context: dict[str, Any], model: str, error: OpenRouterError) -> None:
+    def _write_error_cache(self, context: dict[str, Any], model: str, error: OpenRouterError | GeminiError) -> None:
         record = {
             "cache_key": context["cache_key"],
             "created_at": utc_now(),
+            "provider": self.config.provider,
             "model": model,
+            "model_requested": model,
+            "model_actual": model,
             "prompt_version": self.config.prompt_version,
             "schema_version": self.schema_version,
             "input_hash": context["input_hash"],
@@ -729,10 +815,13 @@ class BatchTaggingRunner:
             "response_raw": {
                 "error": str(error),
                 "status_code": error.status_code,
+                "api_key_index": getattr(error, "api_key_index", None),
                 "response_body_sample": error.response_body[:2000],
             },
             "response_parsed": None,
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0},
+            "usage_source": "api",
+            "api_key_index": getattr(error, "api_key_index", None),
             "estimated_cost_usd": 0.0,
             "latency_ms": 0,
             "finish_reason": "",
@@ -741,7 +830,7 @@ class BatchTaggingRunner:
         }
         self.cache.set(context["cache_key"], record)
 
-    def _record_http_error(self, error: OpenRouterError) -> None:
+    def _record_http_error(self, error: OpenRouterError | GeminiError) -> None:
         status_key = str(error.status_code or "network")
         counts = self.stats["http_status_counts"]
         counts[status_key] = int(counts.get(status_key, 0)) + 1
@@ -785,13 +874,29 @@ class BatchTaggingRunner:
                         quote_summary[quote_status] += 1
         latencies = self.stats["latencies_ms"]
         limiter_snapshot = self.rate_limiter.snapshot()
+        wall_finished_at = utc_now()
+        wall_clock_seconds = _seconds_between(started_at, wall_finished_at)
+        wall_clock_hours = wall_clock_seconds / 3600 if wall_clock_seconds > 0 else 0.0
+        estimated_cost = round(float(self.stats["estimated_cost_usd"]), 8)
+        docs_per_hour = round(len(selected_successes) / wall_clock_hours, 3) if wall_clock_hours else 0.0
+        requests_per_hour = round(float(self.stats["llm_api_attempts_total"]) / wall_clock_hours, 3) if wall_clock_hours else 0.0
+        quote_total = sum(quote_summary.values())
+        warnings: list[str] = []
+        if quote_total and (quote_summary.get("not_found", 0) / quote_total) > 0.01:
+            warnings.append("high_quote_not_found_share")
+        if entities_total and (entities_by_role.get("context_only", 0) / entities_total) > 0.50:
+            warnings.append("high_context_only_share")
         report = {
             "stage": "tagging_batch_calibration",
             "run_id": self.run_id,
             "experiment_name": self.config.experiment_name,
+            "provider": self.config.provider,
+            "model_requested": self.config.model,
+            "model_role": self.config.model_role,
+            "fallback_model": self.config.fallback_model,
             "started_at": started_at,
-            "finished_at": utc_now(),
-            "wall_clock_seconds": _seconds_between(started_at, utc_now()),
+            "finished_at": wall_finished_at,
+            "wall_clock_seconds": wall_clock_seconds,
             "documents_requested": len(selected_documents),
             "documents_tagged": len(selected_successes),
             "documents_failed": len(selected_failures),
@@ -816,6 +921,8 @@ class BatchTaggingRunner:
             "retry_after_values_seconds": limiter_snapshot["retry_after_values_seconds"],
             "cooldown_events_count": limiter_snapshot["cooldown_events_count"],
             "cooldown_seconds_total": limiter_snapshot["cooldown_seconds_total"],
+            "gemini_keys_count": client_keys_count(self.client) if self.config.provider == "gemini_direct" else 0,
+            "gemini_key_stats": client_key_stats(self.client) if self.config.provider == "gemini_direct" else {},
             "batch_requests_count": self.stats["batch_requests_count"],
             "batch_documents_requested": self.stats["batch_documents_requested"],
             "batch_documents_succeeded": self.stats["batch_documents_succeeded"],
@@ -826,20 +933,28 @@ class BatchTaggingRunner:
             "active_records_count": len(active_success_records),
             "active_duplicate_doc_ids": _duplicate_doc_id_count(active_success_records),
             "quote_validation_summary": dict(sorted(quote_summary.items())),
+            "quote_summary": dict(sorted(quote_summary.items())),
             "cache_hits": self.stats["cache_hits"],
             "cache_misses": self.stats["cache_misses"],
-            "estimated_cost_usd": round(float(self.stats["estimated_cost_usd"]), 8),
+            "estimated_cost_usd": estimated_cost,
+            "cost_per_document_usd": round(estimated_cost / len(selected_successes), 8) if selected_successes else 0.0,
+            "projected_full_corpus_cost_usd": (
+                round((estimated_cost / len(selected_successes)) * FULL_CORPUS_DOCUMENTS_ESTIMATE, 2)
+                if selected_successes
+                else 0.0
+            ),
+            "docs_per_hour": docs_per_hour,
+            "requests_per_hour": requests_per_hour,
             "avg_latency_ms": int(sum(latencies) / len(latencies)) if latencies else 0,
             "invalid_json_count": self.stats["invalid_json_count"],
             "budget_limit_usd": self.config.max_cost_usd,
             "stop_reason": stop_reason,
             "notes": self.stats["notes"],
             "suspicious_notes": self.stats["suspicious_notes"],
+            "warnings": warnings,
         }
-        wall_clock_seconds = float(report["wall_clock_seconds"])
-        wall_clock_hours = wall_clock_seconds / 3600 if wall_clock_seconds > 0 else 0.0
         token_total = _usage_tokens_total(selected_successes)
-        report["requests_per_hour_effective"] = round(float(report["llm_api_attempts_total"]) / wall_clock_hours, 3) if wall_clock_hours else 0.0
+        report["requests_per_hour_effective"] = requests_per_hour
         report["documents_per_hour_effective"] = round(len(selected_successes) / wall_clock_hours, 3) if wall_clock_hours else 0.0
         report["tokens_per_hour_effective"] = round(token_total / wall_clock_hours, 3) if wall_clock_hours else 0.0
         return report
@@ -847,7 +962,9 @@ class BatchTaggingRunner:
     def _write_manifest(self, report: dict[str, Any]) -> None:
         manifest = {
             "run_id": self.run_id,
+            "provider": self.config.provider,
             "model": self.config.model,
+            "model_role": self.config.model_role,
             "fallback_model": self.config.fallback_model,
             "prompt_version": self.config.prompt_version,
             "schema_version": "document_tagging_v2",
@@ -862,6 +979,7 @@ class BatchTaggingRunner:
             "created_at": utc_now(),
             "active_success_path": str(self.paths.active_success_path),
             "active_failures_path": str(self.paths.active_failures_path),
+            "empty_documents_candidates_path": str(self.paths.empty_documents_candidates_path),
         }
         self.paths.tagging_dir.mkdir(parents=True, exist_ok=True)
         with self.paths.manifest_path.open("w", encoding="utf-8") as fh:
@@ -875,7 +993,16 @@ def run_batch_tagging_calibration(
     logger: logging.Logger | None = None,
     rate_limiter: AdaptiveRateLimiter | None = None,
 ) -> dict[str, Any]:
-    actual_client = client if client is not None else OpenRouterClient()
+    if client is not None:
+        actual_client = client
+    elif config.provider == "gemini_direct":
+        actual_client = GeminiClient(
+            timeout_seconds=300,
+            rate_limit_backoff_seconds=config.rate_limit_backoff_seconds,
+            max_rate_limit_backoff_seconds=config.max_rate_limit_backoff_seconds,
+        )
+    else:
+        actual_client = OpenRouterClient()
     return BatchTaggingRunner(config=config, client=actual_client, logger=logger, rate_limiter=rate_limiter).run()
 
 
@@ -926,9 +1053,16 @@ def build_batch_user_message(
 
 
 def _validate_config(config: BatchTaggingConfig) -> None:
-    validate_model_id(config.model)
-    if config.fallback_model is not None:
-        validate_model_id(config.fallback_model)
+    if config.provider not in {"openrouter", "gemini_direct"}:
+        raise ValueError("provider must be openrouter or gemini_direct")
+    if config.provider == "gemini_direct":
+        validate_direct_gemini_model_id(config.model)
+        if config.fallback_model is not None:
+            validate_direct_gemini_model_id(config.fallback_model)
+    else:
+        validate_model_id(config.model)
+        if config.fallback_model is not None:
+            validate_model_id(config.fallback_model)
     if config.limit is not None and config.limit <= 0:
         raise ValueError("limit must be positive or None")
     if config.max_cost_usd < 0:
@@ -945,16 +1079,34 @@ def _validate_config(config: BatchTaggingConfig) -> None:
         raise ValueError("max_output_tokens must be > 0")
     if config.max_inflight <= 0:
         raise ValueError("max_inflight must be > 0")
-    if config.structured_output_mode not in {"strict", "schema_lite", "prompt_json"}:
-        raise ValueError("structured_output_mode must be strict, schema_lite or prompt_json")
+    if config.structured_output_mode not in {"strict", "schema_lite", "prompt_json", "gemini_schema", "gemini_schema_lite"}:
+        raise ValueError(
+            "structured_output_mode must be strict, schema_lite, prompt_json, gemini_schema or gemini_schema_lite"
+        )
+    if config.provider == "openrouter" and config.structured_output_mode not in {"strict", "schema_lite", "prompt_json"}:
+        raise ValueError("OpenRouter provider supports strict, schema_lite or prompt_json")
+    if config.provider == "gemini_direct" and config.structured_output_mode not in {
+        "gemini_schema",
+        "gemini_schema_lite",
+        "prompt_json",
+    }:
+        raise ValueError("Gemini direct provider supports gemini_schema, gemini_schema_lite or prompt_json")
     if config.output_schema_version not in {"document_tagging_v2", "compact_tagging_v2"}:
         raise ValueError("output_schema_version must be document_tagging_v2 or compact_tagging_v2")
-    if config.prompt_version not in {"tagging_v2", "tagging_v2_compact"}:
-        raise ValueError("prompt_version must be tagging_v2 or tagging_v2_compact")
+    if config.provider == "gemini_direct" and config.output_schema_version == "compact_tagging_v2":
+        raise ValueError("compact_tagging_v2 is not allowed in Gemini direct production mode")
+    if config.prompt_version not in {"tagging_v2", "tagging_v2_compact", "tagging_v2_gemini"}:
+        raise ValueError("prompt_version must be tagging_v2, tagging_v2_compact or tagging_v2_gemini")
+    if config.provider == "gemini_direct" and config.prompt_version != "tagging_v2_gemini":
+        raise ValueError("Gemini direct provider requires prompt_version=tagging_v2_gemini")
     if config.tagging_text_mode not in {"full", "compact"}:
         raise ValueError("tagging_text_mode must be full or compact")
     if config.tagging_char_limit <= 0:
         raise ValueError("tagging_char_limit must be > 0")
+    if config.thinking_level is not None and config.thinking_level not in {"minimal", "low", "medium", "high"}:
+        raise ValueError("thinking_level must be minimal, low, medium, high or None")
+    if config.thinking_budget is not None and config.thinking_budget < -1:
+        raise ValueError("thinking_budget must be >= -1")
     if config.experiment_name is not None and not config.experiment_name.replace("_", "").replace("-", "").isalnum():
         raise ValueError("experiment_name may contain only letters, digits, '-' and '_'")
 
@@ -1004,6 +1156,7 @@ def _output_paths(data_dir: Path, experiment_name: str | None) -> OutputPaths:
         manifest_path=tagging_dir / "tagging_active_manifest.json",
         report_path=reports_dir / "tagging_report.json",
         alias_success_path=alias_success_path,
+        empty_documents_candidates_path=tagging_dir / "empty_documents_name_candidates.jsonl",
     )
 
 
@@ -1011,6 +1164,7 @@ def _load_prompt(prompt_version: str) -> str:
     prompts = {
         "tagging_v2": "tagging_v2.md",
         "tagging_v2_compact": "tagging_v2_compact.md",
+        "tagging_v2_gemini": "tagging_v2_gemini.md",
     }
     return (Path(__file__).parent / "prompts" / prompts[prompt_version]).read_text(encoding="utf-8")
 
@@ -1023,6 +1177,25 @@ def _build_tagging_text(document_name: str, clean_text: str, mode: str, char_lim
     head = clean_text[:head_size]
     tail = clean_text[-tail_size:] if tail_size else ""
     return f"{head}\n\n[...]\n\n{tail}"
+
+
+def _gemini_thinking_config(
+    *,
+    model: str,
+    thinking_level: str | None,
+    thinking_budget: int | None,
+) -> dict[str, Any]:
+    if thinking_level is not None and thinking_budget is not None:
+        raise ValueError("use either thinking_level or thinking_budget, not both")
+    if thinking_level is not None:
+        return {"thinkingLevel": thinking_level}
+    if thinking_budget is not None:
+        return {"thinkingBudget": thinking_budget}
+    if model.startswith("gemini-3") or model in {"gemini-flash-latest", "gemini-pro-latest", "gemini-flash-lite-latest"}:
+        return {"thinkingLevel": "minimal"}
+    if model.startswith("gemini-2.5-flash"):
+        return {"thinkingBudget": 0}
+    return {}
 
 
 def _parsed_documents_by_id(parsed: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1084,6 +1257,7 @@ def _active_success_matches(record: dict[str, Any] | None, config: BatchTaggingC
         return False
     return (
         record.get("requested_model") == config.model
+        and record.get("provider", "openrouter") == config.provider
         and record.get("prompt_version") == config.prompt_version
         and record.get("schema_version") == "document_tagging_v2"
         and record.get("raw_schema_version", "document_tagging_v2") == config.output_schema_version
@@ -1097,6 +1271,7 @@ def _active_failure_matches(record: dict[str, Any] | None, config: BatchTaggingC
         return False
     return (
         record.get("requested_model") == config.model
+        and record.get("provider", "openrouter") == config.provider
         and record.get("prompt_version") == config.prompt_version
         and record.get("schema_version") == "document_tagging_v2"
         and record.get("raw_schema_version", "document_tagging_v2") == config.output_schema_version
@@ -1138,6 +1313,23 @@ def _safe_usage(value: Any) -> dict[str, int]:
         "prompt_tokens": int(value.get("prompt_tokens") or 0),
         "completion_tokens": int(value.get("completion_tokens") or 0),
         "reasoning_tokens": int(value.get("reasoning_tokens") or 0),
+    }
+
+
+def _optional_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _empty_document_candidate(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "doc_id": str(record.get("doc_id", "")),
+        "document_name": str(record.get("document_name", "")),
+        "reason": "empty_clean_text",
+        "suggested_action": "manual_review_or_name_based_tagging_later",
     }
 
 
