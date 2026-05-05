@@ -21,6 +21,7 @@ from kb_rebuild.llm.openrouter_client import OpenRouterClient, load_dotenv_openr
 from kb_rebuild.llm.tagging_batch import BatchTaggingConfig, run_batch_tagging_calibration
 from kb_rebuild.llm.tagging import TaggingConfig, run_tagging_calibration
 from kb_rebuild.normalization.n1_runner import N1Config, run_normalization_n1
+from kb_rebuild.normalization.n2.runner import N2Config, run_normalization_n2
 from kb_rebuild.parsing.documents import parse_csv_documents
 from kb_rebuild.parsing.validate import validate_parsed_artifacts
 from kb_rebuild.reports.run_report import RunReport, write_run_report
@@ -153,6 +154,15 @@ def build_parser() -> argparse.ArgumentParser:
     normalize_n1_parser.add_argument("--min-mentions-for-report", type=_positive_int, default=1)
     normalize_n1_parser.add_argument("--no-overwrite", action="store_true", help="Fail if any N1 output already exists")
     normalize_n1_parser.set_defaults(func=run_normalize_n1)
+
+    normalize_n2_parser = subparsers.add_parser("normalize-n2", help="Run N2 normalization candidate generation")
+    normalize_n2_parser.add_argument("--data", default="data", help="Data directory")
+    normalize_n2_parser.add_argument("--normalization-dir", default=None, help="N1.1 normalization output directory")
+    normalize_n2_parser.add_argument("--out", default=None, help="N2 output directory")
+    normalize_n2_parser.add_argument("--min-score", type=_score_float, default=0.72)
+    normalize_n2_parser.add_argument("--high-priority-score", type=_score_float, default=0.88)
+    normalize_n2_parser.add_argument("--max-pairs-per-type", type=_positive_int, default=50000)
+    normalize_n2_parser.set_defaults(func=run_normalize_n2)
 
     return parser
 
@@ -534,6 +544,53 @@ def run_normalize_n1(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_normalize_n2(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data)
+    logger = configure_logging(data_dir)
+    config = N2Config.from_data_dir(
+        data_dir,
+        normalization_dir=Path(args.normalization_dir) if args.normalization_dir else None,
+        out_dir=Path(args.out) if args.out else None,
+        min_score=args.min_score,
+        high_priority_score=args.high_priority_score,
+        max_pairs_per_type=args.max_pairs_per_type,
+    )
+    logger.info(
+        "normalization N2 started data_dir=%s normalization_dir=%s out=%s min_score=%s high_priority_score=%s max_pairs_per_type=%s",
+        config.data_dir,
+        config.normalization_dir,
+        config.out_dir,
+        config.min_score,
+        config.high_priority_score,
+        config.max_pairs_per_type,
+    )
+    try:
+        report = run_normalization_n2(config)
+    except Exception as exc:
+        logger.exception("normalization N2 failed")
+        print(f"Normalization N2 failed: {exc}")
+        return 1
+
+    counts = report.get("counts", {})
+    logger.info("normalization N2 finished counts=%s", counts)
+    print(
+        "Normalization N2 complete: "
+        f"nodes={counts.get('nodes_total', 0)} "
+        f"candidate_pairs={counts.get('candidate_pairs_total', 0)} "
+        f"blocked_pairs={counts.get('blocked_pairs', 0)} "
+        f"rejected_pairs={counts.get('rejected_low_score_pairs', 0)} "
+        f"groups={counts.get('candidate_groups_total', 0)} "
+        f"high_groups={counts.get('high_priority_groups', 0)} "
+        f"out={config.out_dir}"
+    )
+    warnings = report.get("warnings", [])
+    for warning in warnings[:10]:
+        print(f"WARNING: {warning}")
+    if len(warnings) > 10:
+        print(f"WARNING: {len(warnings) - 10} more warnings in candidate_generation_report.json")
+    return 0
+
+
 def configure_logging(out_dir: Path) -> logging.Logger:
     logs_dir = out_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -571,6 +628,13 @@ def _non_negative_float(value: str) -> float:
     parsed = float(value)
     if parsed < 0:
         raise argparse.ArgumentTypeError("value must be >= 0")
+    return parsed
+
+
+def _score_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0.0 or parsed > 1.0:
+        raise argparse.ArgumentTypeError("score must be between 0 and 1")
     return parsed
 
 
