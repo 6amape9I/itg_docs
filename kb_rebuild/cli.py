@@ -580,6 +580,7 @@ def run_normalize_n2(args: argparse.Namespace) -> int:
         f"blocked_pairs={counts.get('blocked_pairs', 0)} "
         f"rejected_pairs={counts.get('rejected_low_score_pairs', 0)} "
         f"groups={counts.get('candidate_groups_total', 0)} "
+        f"n3_groups={counts.get('n3_candidate_groups', 0)} "
         f"high_groups={counts.get('high_priority_groups', 0)} "
         f"out={config.out_dir}"
     )

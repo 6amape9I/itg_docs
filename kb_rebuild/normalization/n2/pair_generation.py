@@ -7,6 +7,7 @@ from typing import Any
 from kb_rebuild.normalization.n2.blocking import blocking_reasons, risk_reasons
 from kb_rebuild.normalization.n2.features import (
     abbreviations_for_node,
+    has_clean_reason,
     has_strong_reason,
     parenthetical_aliases,
     score_pair_features,
@@ -196,7 +197,7 @@ def generate_candidate_pairs(
             evaluated = sorted(evaluated, key=_pair_sort_key)[:max_pairs_per_type]
 
         for pair in evaluated:
-            if pair.pair_status in {"candidate", "high_priority_candidate"}:
+            if pair.pair_status in {"candidate", "high_priority_candidate", "low_confidence_candidate"}:
                 candidate_pairs.append(pair)
             elif pair.pair_status == "blocked":
                 blocked_pairs.append(pair)
@@ -287,15 +288,29 @@ def _evaluate_pair(
 
     if blocking:
         status = "blocked"
-    elif score >= high_priority_score or has_strong_reason(features.candidate_reasons):
+    elif "ambiguous_abbreviation" in risks or "generic_alias_conflict" in risks:
+        status = "low_confidence_candidate"
+    elif score >= high_priority_score or has_strong_reason(features.clean_candidate_reasons):
         status = "high_priority_candidate"
-    elif score >= min_score:
+    elif score >= min_score and has_clean_reason(features.clean_candidate_reasons):
         status = "candidate"
+    elif score >= min_score:
+        status = "low_confidence_candidate"
     else:
         status = "rejected_low_score"
 
     metrics = dict(features.metrics)
     metrics["token_jaccard"] = round(token_jaccard(left.normalized_label, right.normalized_label), 6)
+    scope_reasons = [reason for reason in blocking if "scope" in reason]
+    abbreviation_source = [str(source) for source in metrics.get("abbreviation_source", [])]
+    generic_alias_match = bool(metrics.get("generic_aliases_matched"))
+    n3_pair_ready = _n3_pair_ready(
+        status=status,
+        clean_reasons=features.clean_candidate_reasons,
+        risks=risks,
+        blocking=blocking,
+        generic_alias_match=generic_alias_match,
+    )
     return CandidatePair(
         pair_id=f"p_{pair_index:09d}",
         left_node_id=left.node_id,
@@ -306,10 +321,38 @@ def _evaluate_pair(
         score=score,
         pair_status=status,
         candidate_reasons=features.candidate_reasons,
+        clean_candidate_reasons=features.clean_candidate_reasons,
+        weak_candidate_reasons=features.weak_candidate_reasons,
         risk_reasons=risks,
         blocking_reasons=blocking,
+        candidate_quality="n3_ready" if n3_pair_ready else status,
+        scope_conflict_reasons=scope_reasons,
+        abbreviation_source=abbreviation_source,
+        generic_alias_match=generic_alias_match,
+        n3_pair_ready=n3_pair_ready,
         metrics=metrics,
     )
+
+
+def _n3_pair_ready(
+    *,
+    status: str,
+    clean_reasons: list[str],
+    risks: list[str],
+    blocking: list[str],
+    generic_alias_match: bool,
+) -> bool:
+    if status not in {"candidate", "high_priority_candidate"}:
+        return False
+    disallowed = {
+        "both_context_only",
+        "parent_child_suspect",
+        "generic_alias_conflict",
+        "ambiguous_abbreviation",
+    }
+    if blocking or set(risks) & disallowed or generic_alias_match:
+        return False
+    return has_clean_reason(clean_reasons)
 
 
 def _group_by_type(nodes: list[CandidateNode]) -> dict[str, list[CandidateNode]]:
@@ -416,7 +459,8 @@ def _pair_sort_key(pair: CandidatePair) -> tuple[int, float, str]:
     status_rank = {
         "high_priority_candidate": 0,
         "candidate": 1,
-        "blocked": 2,
-        "rejected_low_score": 3,
+        "low_confidence_candidate": 2,
+        "blocked": 3,
+        "rejected_low_score": 4,
     }.get(pair.pair_status, 9)
     return (status_rank, -pair.score, pair.pair_id)

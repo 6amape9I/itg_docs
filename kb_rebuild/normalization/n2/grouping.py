@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 
-from kb_rebuild.normalization.n2.features import has_strong_reason
+from kb_rebuild.normalization.n2.features import has_clean_reason, has_strong_reason
 from kb_rebuild.normalization.n2.models import CandidateGroup, CandidateNode, CandidatePair
 
 
 MAX_GROUP_SIZE = 12
 MAX_BLOCKED_REVIEW_GROUPS = 5000
+HUB_N3_GROUP_LIMIT = 5
 
 
 def build_candidate_groups(
@@ -21,7 +23,7 @@ def build_candidate_groups(
     edge_pairs = {
         frozenset((pair.left_node_id, pair.right_node_id)): pair
         for pair in candidate_pairs
-        if pair.pair_status in {"candidate", "high_priority_candidate"}
+        if pair.pair_status in {"candidate", "high_priority_candidate", "low_confidence_candidate"}
     }
     groups: list[set[str]] = []
 
@@ -84,7 +86,7 @@ def build_candidate_groups(
         )
         blocked_added += 1
 
-    return candidate_groups
+    return _apply_hub_protection(candidate_groups)
 
 
 def _pairwise_compatible(node_ids: set[str], edge_pairs: dict[frozenset[str], CandidatePair]) -> bool:
@@ -110,6 +112,24 @@ def _group_from_nodes_and_pairs(
     if len(entity_types) != 1:
         raise ValueError(f"group contains mixed entity types: {sorted(entity_types)}")
     reasons = sorted({reason for pair in pairs for reason in pair.candidate_reasons})
+    clean_reasons = sorted({reason for pair in pairs for reason in pair.clean_candidate_reasons})
+    weak_reasons = sorted({reason for pair in pairs for reason in pair.weak_candidate_reasons})
+    scope_conflicts = sorted({reason for pair in pairs for reason in pair.scope_conflict_reasons})
+    ambiguous_abbreviations = sorted(
+        {
+            abbreviation
+            for pair in pairs
+            for abbreviation in pair.metrics.get("abbreviations_matched", [])
+            if "ambiguous_abbreviation" in pair.risk_reasons
+        }
+    )
+    generic_aliases = sorted(
+        {
+            alias
+            for pair in pairs
+            for alias in pair.metrics.get("generic_aliases_matched", [])
+        }
+    )
     risks = sorted(
         {risk for pair in pairs for risk in pair.risk_reasons}
         | {reason for pair in pairs for reason in pair.blocking_reasons}
@@ -129,13 +149,32 @@ def _group_from_nodes_and_pairs(
         sum(node.context_only_count for node in group_nodes),
         mentions_count,
     )
+    if "both_context_only" in risks and context_only_count < mentions_count:
+        risks = sorted((set(risks) - {"both_context_only"}) | {"partial_context_only_pair"})
     priority = _group_priority(
         pairs=pairs,
         group_score=group_score,
         article_candidate_count=article_candidate_count,
         risks=risks,
+        clean_reasons=clean_reasons,
         high_priority_score=high_priority_score,
         blocked=blocked,
+    )
+    status, exclusions = _group_status_and_exclusions(
+        blocked=blocked,
+        priority=priority,
+        pairs=pairs,
+        clean_reasons=clean_reasons,
+        risks=risks,
+        scope_conflicts=scope_conflicts,
+        generic_aliases=generic_aliases,
+        ambiguous_abbreviations=ambiguous_abbreviations,
+    )
+    recommended = _recommended_for_n3(
+        status=status,
+        priority=priority,
+        clean_reasons=clean_reasons,
+        exclusions=exclusions,
     )
     documents = _sample_documents(group_nodes)
     return CandidateGroup(
@@ -146,10 +185,19 @@ def _group_from_nodes_and_pairs(
         pair_ids=[pair.pair_id for pair in pairs],
         group_score=group_score,
         group_priority=priority,
+        candidate_group_status=status,
+        n3_ready=recommended,
         candidate_reasons=reasons,
+        clean_candidate_reasons=clean_reasons,
+        weak_candidate_reasons=weak_reasons,
         group_risk_flags=risks,
-        requires_llm_validation=priority != "blocked_review",
-        recommended_for_n3=priority in {"high", "medium"},
+        exclusion_reasons=exclusions,
+        hub_node_ids=[],
+        generic_aliases_matched=generic_aliases,
+        ambiguous_abbreviations=ambiguous_abbreviations,
+        scope_conflict_reasons=scope_conflicts,
+        requires_llm_validation=status != "blocked_review",
+        recommended_for_n3=recommended,
         mentions_count=mentions_count,
         documents_count=len({doc["doc_id"] for node in group_nodes for doc in node.documents}),
         article_candidate_count=article_candidate_count,
@@ -164,20 +212,104 @@ def _group_priority(
     group_score: float,
     article_candidate_count: int,
     risks: list[str],
+    clean_reasons: list[str],
     high_priority_score: float,
     blocked: bool,
 ) -> str:
     if blocked:
         return "blocked_review"
+    if not has_clean_reason(clean_reasons):
+        return "low"
     if (
         group_score >= high_priority_score
         or any(pair.pair_status == "high_priority_candidate" for pair in pairs)
-        or any(has_strong_reason(pair.candidate_reasons) for pair in pairs)
+        or any(has_strong_reason(pair.clean_candidate_reasons) for pair in pairs)
     ) and article_candidate_count:
         return "high"
     if group_score >= 0.72:
         return "medium"
     return "low"
+
+
+def _group_status_and_exclusions(
+    *,
+    blocked: bool,
+    priority: str,
+    pairs: list[CandidatePair],
+    clean_reasons: list[str],
+    risks: list[str],
+    scope_conflicts: list[str],
+    generic_aliases: list[str],
+    ambiguous_abbreviations: list[str],
+) -> tuple[str, list[str]]:
+    exclusions: set[str] = set()
+    blocking = {reason for pair in pairs for reason in pair.blocking_reasons}
+    if blocked or blocking:
+        exclusions.update(blocking or {"blocked_pair"})
+        if scope_conflicts or "parent_child_suspect" in blocking or "parent_child_blocked" in blocking:
+            return "hub_parent_child_suspect", sorted(exclusions)
+        return "blocked_review", sorted(exclusions)
+    if scope_conflicts or "parent_child_suspect" in risks:
+        exclusions.update(scope_conflicts or {"parent_child_suspect"})
+        return "hub_parent_child_suspect", sorted(exclusions)
+    if ambiguous_abbreviations or "ambiguous_abbreviation" in risks:
+        exclusions.add("ambiguous_abbreviation")
+        return "ambiguous_abbreviation", sorted(exclusions)
+    if generic_aliases or "generic_alias_conflict" in risks:
+        exclusions.add("generic_alias_conflict")
+        return "generic_alias_conflict", sorted(exclusions)
+    if "both_context_only" in risks:
+        exclusions.add("both_context_only")
+    if not has_clean_reason(clean_reasons):
+        exclusions.add("no_clean_candidate_reason")
+    if priority not in {"high", "medium"}:
+        exclusions.add("low_priority")
+    if exclusions:
+        return "low_confidence_candidate", sorted(exclusions)
+    return "n3_candidate", []
+
+
+def _recommended_for_n3(
+    *,
+    status: str,
+    priority: str,
+    clean_reasons: list[str],
+    exclusions: list[str],
+) -> bool:
+    return status == "n3_candidate" and priority in {"high", "medium"} and has_clean_reason(clean_reasons) and not exclusions
+
+
+def _apply_hub_protection(groups: list[CandidateGroup]) -> list[CandidateGroup]:
+    n3_counts: Counter[str] = Counter()
+    for group in groups:
+        if group.n3_ready:
+            n3_counts.update(group.node_ids)
+    hub_node_ids = {node_id for node_id, count in n3_counts.items() if count > HUB_N3_GROUP_LIMIT}
+    if not hub_node_ids:
+        return groups
+
+    protected: list[CandidateGroup] = []
+    for group in groups:
+        group_hubs = sorted(hub_node_ids & set(group.node_ids))
+        if group.n3_ready and group_hubs and not _hub_safe_exception(group):
+            exclusions = sorted(set(group.exclusion_reasons) | {"hub_parent_child_suspect"})
+            protected.append(
+                replace(
+                    group,
+                    candidate_group_status="hub_parent_child_suspect",
+                    n3_ready=False,
+                    recommended_for_n3=False,
+                    hub_node_ids=group_hubs,
+                    exclusion_reasons=exclusions,
+                )
+            )
+        else:
+            protected.append(group)
+    return protected
+
+
+def _hub_safe_exception(group: CandidateGroup) -> bool:
+    return len(group.node_ids) <= MAX_GROUP_SIZE and "product_variant_match" in group.clean_candidate_reasons
 
 
 def _sample_documents(nodes: list[CandidateNode]) -> list[dict[str, str]]:

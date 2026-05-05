@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from kb_rebuild.normalization.n2.features import has_strong_reason, short_alias, tokens
 from kb_rebuild.normalization.n2.models import CandidateNode
+from kb_rebuild.normalization.n2.scope_conflict import scope_conflict_reasons
 from kb_rebuild.normalization.text import is_latin_only, normalize_basic_text
 
 
@@ -17,9 +18,12 @@ def blocking_reasons(left: CandidateNode, right: CandidateNode, candidate_reason
     if left.entity_type == "microorganism" and _taxonomic_level_conflict(left.normalized_label, right.normalized_label):
         reasons.add("taxonomic_level_conflict")
 
+    scope_reasons = scope_conflict_reasons(left, right)
+    reasons.update(scope_reasons)
+
     if _parent_child_suspect(left, right) and not _product_variant_exception(left, right, candidate_reasons):
         reasons.add("parent_child_suspect")
-        if left.entity_type in {"disease", "drug_class", "organ_or_body_system"}:
+        if left.entity_type in {"disease", "drug_class", "organ_or_body_system", "diagnostic_method", "procedure"}:
             reasons.add("parent_child_blocked")
 
     if short_alias(left.normalized_label) and short_alias(right.normalized_label) and not has_strong_reason(candidate_reasons):
@@ -32,6 +36,7 @@ def risk_reasons(left: CandidateNode, right: CandidateNode) -> list[str]:
     reasons: set[str] = set()
     if left.entity_type == "drug_trade_name" and {"latin_only"} & (set(left.risk_flags) | set(right.risk_flags)):
         reasons.add("possible_brand_substance_conflict")
+    reasons.update(scope_conflict_reasons(left, right))
     if _parent_child_suspect(left, right) and not _same_product_variant(left, right):
         reasons.add("parent_child_suspect")
     return sorted(reasons)

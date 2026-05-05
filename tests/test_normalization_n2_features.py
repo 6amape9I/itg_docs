@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from kb_rebuild.normalization.n2.features import abbreviation_match, parenthetical_alias_match, score_pair_features
+from kb_rebuild.normalization.n2.features import (
+    abbreviation_match,
+    abbreviation_match_details,
+    exact_match_details,
+    parenthetical_alias_match,
+    score_pair_features,
+)
 from kb_rebuild.normalization.n2.models import CandidateNode
 
 
@@ -12,6 +18,33 @@ class NormalizationN2FeaturesTests(unittest.TestCase):
 
         self.assertGreaterEqual(pair.score, 0.8)
         self.assertIn("exact_normalized_match", pair.candidate_reasons)
+        self.assertIn("primary_label_exact_match", pair.clean_candidate_reasons)
+
+    def test_exact_generic_alias_only_is_not_clean(self) -> None:
+        pair = score_pair_features(
+            _node(
+                "n1",
+                "diagnostic_method",
+                "МРТ гипофиза",
+                aliases=["МРТ гипофиза", "Магнитно-резонансная томография"],
+            ),
+            _node("n2", "diagnostic_method", "Магнитно-резонансная томография"),
+        )
+
+        self.assertEqual(
+            exact_match_details(
+                _node(
+                    "n1",
+                    "diagnostic_method",
+                    "МРТ гипофиза",
+                    aliases=["МРТ гипофиза", "Магнитно-резонансная томография"],
+                ),
+                _node("n2", "diagnostic_method", "Магнитно-резонансная томография"),
+            )["match_type"],
+            "generic_alias_exact_match",
+        )
+        self.assertIn("generic_alias_conflict", pair.risk_reasons)
+        self.assertNotIn("primary_label_exact_match", pair.clean_candidate_reasons)
 
     def test_typo_labels_score_moderate(self) -> None:
         pair = score_pair_features(_node("n1", "disease", "гастрит"), _node("n2", "disease", "гастритт"))
@@ -23,6 +56,16 @@ class NormalizationN2FeaturesTests(unittest.TestCase):
         self.assertTrue(abbreviation_match(_node("n1", "diagnostic_method", "Иммуноферментный анализ"), _node("n2", "diagnostic_method", "ИФА")))
         self.assertTrue(abbreviation_match(_node("n1", "diagnostic_method", "Полимеразная цепная реакция"), _node("n2", "diagnostic_method", "ПЦР")))
         self.assertTrue(abbreviation_match(_node("n1", "diagnostic_method", "Магнитно-резонансная томография"), _node("n2", "diagnostic_method", "МРТ")))
+
+    def test_generated_ambiguous_abbreviation_not_clean(self) -> None:
+        details = abbreviation_match_details(
+            _node("n1", "diagnostic_method", "Квантифероновый тест"),
+            _node("n2", "diagnostic_method", "Компьютерная томография"),
+        )
+
+        self.assertTrue(details["matched"])
+        self.assertTrue(details["ambiguous"])
+        self.assertFalse(details["clean"])
 
     def test_parenthetical_alias_match(self) -> None:
         self.assertTrue(parenthetical_alias_match(_node("n1", "disease", "Вирус папилломы человека (ВПЧ)"), _node("n2", "disease", "ВПЧ")))
@@ -53,8 +96,11 @@ def _node(
     product_key: str = "",
     subtype_signature: str = "none",
     risk_flags: list[str] | None = None,
+    aliases: list[str] | None = None,
 ) -> CandidateNode:
     normalized = label.lower().replace("ё", "е")
+    alias_values = aliases or [label]
+    normalized_aliases = [alias.lower().replace("ё", "е") for alias in alias_values]
     return CandidateNode(
         node_id=node_id,
         auto_cluster_id=node_id.replace("n", "ac"),
@@ -62,8 +108,8 @@ def _node(
         label=label,
         normalized_label=normalized,
         latin_label=latin_label.lower(),
-        aliases=[label],
-        normalized_aliases=[normalized],
+        aliases=alias_values,
+        normalized_aliases=normalized_aliases,
         mention_ids=[f"m_{node_id}"],
         documents=[{"doc_id": f"doc_{node_id}", "document_name": label}],
         mentions_count=1,

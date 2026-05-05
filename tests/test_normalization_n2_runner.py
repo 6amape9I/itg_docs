@@ -27,15 +27,31 @@ class NormalizationN2RunnerTests(unittest.TestCase):
                 "candidate_groups.jsonl",
                 "candidate_groups.csv",
                 "high_priority_candidate_groups.csv",
+                "n3_candidate_groups.jsonl",
+                "n3_candidate_groups.csv",
+                "blocked_review_groups.jsonl",
+                "blocked_review_groups.csv",
+                "low_confidence_candidate_groups.csv",
+                "ambiguous_abbreviation_groups.csv",
+                "hub_parent_child_suspects.csv",
+                "generic_alias_conflicts.csv",
+                "group_quality_diagnostics.json",
                 "singleton_fast_path_candidates.csv",
                 "candidate_generation_report.json",
                 "candidate_generation_manifest.json",
             ):
                 self.assertTrue((out / filename).exists(), filename)
             self.assertEqual(report["source_stage_version"], "n1.1")
+            self.assertEqual(report["stage_version"], "n2.1")
             self.assertEqual(report["counts"]["nodes_total"], 2)
             self.assertEqual(report["counts"]["candidate_pairs_total"], 1)
+            self.assertEqual(report["counts"]["n3_candidate_groups"], 1)
+            self.assertTrue(report["quality_gate"]["passed"])
             self.assertEqual(len(read_jsonl(out / "candidate_groups.jsonl")), 1)
+            self.assertEqual(len(read_jsonl(out / "n3_candidate_groups.jsonl")), 1)
+            manifest = json.loads((out / "candidate_generation_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["stage_version"], "n2.1")
+            self.assertIn("n3_candidate_groups_jsonl", manifest["outputs"])
 
     def test_runner_refuses_non_n1_1_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

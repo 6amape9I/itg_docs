@@ -61,6 +61,8 @@ class CandidateNode:
 class PairFeatures:
     score: float
     candidate_reasons: list[str]
+    clean_candidate_reasons: list[str]
+    weak_candidate_reasons: list[str]
     risk_reasons: list[str]
     blocking_reasons: list[str]
     metrics: JsonDict
@@ -77,8 +79,15 @@ class CandidatePair:
     score: float
     pair_status: str
     candidate_reasons: list[str]
+    clean_candidate_reasons: list[str]
+    weak_candidate_reasons: list[str]
     risk_reasons: list[str]
     blocking_reasons: list[str]
+    candidate_quality: str
+    scope_conflict_reasons: list[str]
+    abbreviation_source: list[str]
+    generic_alias_match: bool
+    n3_pair_ready: bool
     metrics: JsonDict
 
     def to_dict(self) -> JsonDict:
@@ -92,8 +101,15 @@ class CandidatePair:
             "score": self.score,
             "pair_status": self.pair_status,
             "candidate_reasons": self.candidate_reasons,
+            "clean_candidate_reasons": self.clean_candidate_reasons,
+            "weak_candidate_reasons": self.weak_candidate_reasons,
             "risk_reasons": self.risk_reasons,
             "blocking_reasons": self.blocking_reasons,
+            "candidate_quality": self.candidate_quality,
+            "scope_conflict_reasons": self.scope_conflict_reasons,
+            "abbreviation_source": self.abbreviation_source,
+            "generic_alias_match": self.generic_alias_match,
+            "n3_pair_ready": self.n3_pair_ready,
             "metrics": self.metrics,
         }
 
@@ -107,8 +123,17 @@ class CandidateGroup:
     pair_ids: list[str]
     group_score: float
     group_priority: str
+    candidate_group_status: str
+    n3_ready: bool
     candidate_reasons: list[str]
+    clean_candidate_reasons: list[str]
+    weak_candidate_reasons: list[str]
     group_risk_flags: list[str]
+    exclusion_reasons: list[str]
+    hub_node_ids: list[str]
+    generic_aliases_matched: list[str]
+    ambiguous_abbreviations: list[str]
+    scope_conflict_reasons: list[str]
     requires_llm_validation: bool
     recommended_for_n3: bool
     mentions_count: int
@@ -126,8 +151,17 @@ class CandidateGroup:
             "pair_ids": self.pair_ids,
             "group_score": self.group_score,
             "group_priority": self.group_priority,
+            "candidate_group_status": self.candidate_group_status,
+            "n3_ready": self.n3_ready,
             "candidate_reasons": self.candidate_reasons,
+            "clean_candidate_reasons": self.clean_candidate_reasons,
+            "weak_candidate_reasons": self.weak_candidate_reasons,
             "group_risk_flags": self.group_risk_flags,
+            "exclusion_reasons": self.exclusion_reasons,
+            "hub_node_ids": self.hub_node_ids,
+            "generic_aliases_matched": self.generic_aliases_matched,
+            "ambiguous_abbreviations": self.ambiguous_abbreviations,
+            "scope_conflict_reasons": self.scope_conflict_reasons,
             "requires_llm_validation": self.requires_llm_validation,
             "recommended_for_n3": self.recommended_for_n3,
             "mentions_count": self.mentions_count,

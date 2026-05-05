@@ -12,6 +12,7 @@ from kb_rebuild.normalization.n2.grouping import build_candidate_groups
 from kb_rebuild.normalization.n2.pair_generation import build_candidate_nodes, generate_candidate_pairs
 from kb_rebuild.normalization.n2.report import (
     build_candidate_groups_csv_rows,
+    build_group_quality_diagnostics,
     build_report,
     build_singleton_fast_path_rows,
     write_csv,
@@ -58,6 +59,15 @@ OUTPUT_FILENAMES = {
     "candidate_groups": "candidate_groups.jsonl",
     "candidate_groups_csv": "candidate_groups.csv",
     "high_priority_candidate_groups_csv": "high_priority_candidate_groups.csv",
+    "n3_candidate_groups_jsonl": "n3_candidate_groups.jsonl",
+    "n3_candidate_groups_csv": "n3_candidate_groups.csv",
+    "blocked_review_groups_jsonl": "blocked_review_groups.jsonl",
+    "blocked_review_groups_csv": "blocked_review_groups.csv",
+    "low_confidence_candidate_groups_csv": "low_confidence_candidate_groups.csv",
+    "ambiguous_abbreviation_groups_csv": "ambiguous_abbreviation_groups.csv",
+    "hub_parent_child_suspects_csv": "hub_parent_child_suspects.csv",
+    "generic_alias_conflicts_csv": "generic_alias_conflicts.csv",
+    "group_quality_diagnostics_json": "group_quality_diagnostics.json",
     "singleton_fast_path_candidates_csv": "singleton_fast_path_candidates.csv",
     "candidate_generation_report": "candidate_generation_report.json",
     "candidate_generation_manifest": "candidate_generation_manifest.json",
@@ -109,18 +119,31 @@ class NormalizationN2Runner:
         self._validate_groups(groups, candidate_pairs, blocked_pairs)
 
         singleton_rows = build_singleton_fast_path_rows(singletons)
+        n3_groups = [group for group in groups if group.n3_ready and group.recommended_for_n3 and group.requires_llm_validation]
+        blocked_review_groups = [
+            group
+            for group in groups
+            if group.candidate_group_status
+            in {"blocked_review", "hub_parent_child_suspect", "ambiguous_abbreviation", "generic_alias_conflict"}
+        ]
         self.config.out_dir.mkdir(parents=True, exist_ok=True)
         write_jsonl(self.paths["candidate_nodes"], (node.to_dict() for node in nodes))
         write_jsonl(self.paths["candidate_pairs"], (pair.to_dict() for pair in candidate_pairs))
         write_jsonl(self.paths["blocked_pairs"], (pair.to_dict() for pair in blocked_pairs))
         write_jsonl(self.paths["rejected_pairs"], (pair.to_dict() for pair in rejected_pairs))
         write_jsonl(self.paths["candidate_groups"], (group.to_dict() for group in groups))
+        write_jsonl(self.paths["n3_candidate_groups_jsonl"], (group.to_dict() for group in n3_groups))
+        write_jsonl(self.paths["blocked_review_groups_jsonl"], (group.to_dict() for group in blocked_review_groups))
 
         group_rows = build_candidate_groups_csv_rows(groups)
+        n3_group_rows = build_candidate_groups_csv_rows(n3_groups)
+        blocked_review_rows = build_candidate_groups_csv_rows(blocked_review_groups)
         group_fields = [
             "candidate_group_id",
             "entity_type",
             "group_priority",
+            "candidate_group_status",
+            "n3_ready",
             "group_score",
             "group_labels",
             "node_ids",
@@ -129,7 +152,14 @@ class NormalizationN2Runner:
             "article_candidate_count",
             "context_only_count",
             "candidate_reasons",
+            "clean_candidate_reasons",
+            "weak_candidate_reasons",
             "group_risk_flags",
+            "exclusion_reasons",
+            "hub_node_ids",
+            "generic_aliases_matched",
+            "ambiguous_abbreviations",
+            "scope_conflict_reasons",
             "requires_llm_validation",
             "recommended_for_n3",
             "sample_documents",
@@ -139,6 +169,28 @@ class NormalizationN2Runner:
             self.paths["high_priority_candidate_groups_csv"],
             group_fields,
             [row for row in group_rows if row.get("group_priority") == "high"],
+        )
+        write_csv(self.paths["n3_candidate_groups_csv"], group_fields, n3_group_rows)
+        write_csv(self.paths["blocked_review_groups_csv"], group_fields, blocked_review_rows)
+        write_csv(
+            self.paths["low_confidence_candidate_groups_csv"],
+            group_fields,
+            [row for row in group_rows if row.get("candidate_group_status") == "low_confidence_candidate"],
+        )
+        write_csv(
+            self.paths["ambiguous_abbreviation_groups_csv"],
+            group_fields,
+            [row for row in group_rows if row.get("candidate_group_status") == "ambiguous_abbreviation"],
+        )
+        write_csv(
+            self.paths["hub_parent_child_suspects_csv"],
+            group_fields,
+            [row for row in group_rows if row.get("candidate_group_status") == "hub_parent_child_suspect"],
+        )
+        write_csv(
+            self.paths["generic_alias_conflicts_csv"],
+            group_fields,
+            [row for row in group_rows if row.get("candidate_group_status") == "generic_alias_conflict"],
         )
         singleton_fields = [
             "candidate_id",
@@ -175,6 +227,7 @@ class NormalizationN2Runner:
             warnings=warnings,
         )
         write_json(self.paths["candidate_generation_report"], report)
+        write_json(self.paths["group_quality_diagnostics_json"], build_group_quality_diagnostics(groups))
         write_json(self.paths["candidate_generation_manifest"], self._build_manifest(created_at))
         return report
 
@@ -213,14 +266,27 @@ class NormalizationN2Runner:
         for group in groups:
             if len(group.node_ids) < 2:
                 raise ValueError(f"{group.candidate_group_id}: candidate group has fewer than 2 nodes")
-            if group.group_priority != "blocked_review" and any(pair_id in blocked_pair_ids for pair_id in group.pair_ids):
+            if group.candidate_group_status not in {
+                "blocked_review",
+                "hub_parent_child_suspect",
+                "ambiguous_abbreviation",
+                "generic_alias_conflict",
+            } and any(pair_id in blocked_pair_ids for pair_id in group.pair_ids):
                 raise ValueError(f"{group.candidate_group_id}: blocked pair entered a normal candidate group")
-            if group.group_priority != "blocked_review" and any(pair_id not in candidate_pair_ids for pair_id in group.pair_ids):
+            if group.candidate_group_status not in {
+                "blocked_review",
+                "hub_parent_child_suspect",
+                "ambiguous_abbreviation",
+                "generic_alias_conflict",
+            } and any(pair_id not in candidate_pair_ids for pair_id in group.pair_ids):
                 raise ValueError(f"{group.candidate_group_id}: normal group references non-candidate pair")
+            if group.n3_ready and group.candidate_group_status != "n3_candidate":
+                raise ValueError(f"{group.candidate_group_id}: n3_ready group has non-n3 status")
 
     def _build_manifest(self, created_at: str) -> dict[str, Any]:
         return {
             "stage": "normalization_n2_candidate_generation",
+            "stage_version": "n2.1",
             "created_at": created_at,
             "source_normalization_manifest": str(self.inputs["normalization_manifest"]),
             "source_stage_version": "n1.1",

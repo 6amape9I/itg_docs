@@ -48,6 +48,38 @@ class NormalizationN2PairGenerationTests(unittest.TestCase):
         self.assertEqual(len(rejected), 1)
         self.assertEqual(rejected[0].pair_status, "rejected_low_score")
 
+    def test_generated_ambiguous_abbreviation_is_low_confidence(self) -> None:
+        warnings: list[str] = []
+        candidate, blocked, rejected = generate_candidate_pairs(
+            [
+                _node("n1", "diagnostic_method", "Квантифероновый тест"),
+                _node("n2", "diagnostic_method", "Компьютерная томография"),
+            ],
+            min_score=0.72,
+            high_priority_score=0.88,
+            max_pairs_per_type=100,
+            warnings=warnings,
+        )
+
+        self.assertEqual(blocked, [])
+        self.assertEqual(rejected, [])
+        self.assertEqual(candidate[0].pair_status, "low_confidence_candidate")
+        self.assertIn("ambiguous_abbreviation", candidate[0].risk_reasons)
+
+    def test_diagnostic_parent_child_pair_blocked(self) -> None:
+        warnings: list[str] = []
+        candidate, blocked, _ = generate_candidate_pairs(
+            [_node("n1", "diagnostic_method", "МРТ"), _node("n2", "diagnostic_method", "МРТ гипофиза")],
+            min_score=0.72,
+            high_priority_score=0.88,
+            max_pairs_per_type=100,
+            warnings=warnings,
+        )
+
+        self.assertEqual(candidate, [])
+        self.assertEqual(len(blocked), 1)
+        self.assertIn("diagnostic_method_scope_conflict", blocked[0].scope_conflict_reasons)
+
     def test_blocked_pairs_written_separately(self) -> None:
         warnings: list[str] = []
         candidate, blocked, _ = generate_candidate_pairs(

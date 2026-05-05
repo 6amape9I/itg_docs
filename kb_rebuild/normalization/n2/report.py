@@ -40,6 +40,8 @@ def build_candidate_groups_csv_rows(groups: list[CandidateGroup]) -> list[dict[s
                 "candidate_group_id": group.candidate_group_id,
                 "entity_type": group.entity_type,
                 "group_priority": group.group_priority,
+                "candidate_group_status": group.candidate_group_status,
+                "n3_ready": group.n3_ready,
                 "group_score": group.group_score,
                 "group_labels": " | ".join(group.group_labels),
                 "node_ids": "; ".join(group.node_ids),
@@ -48,7 +50,14 @@ def build_candidate_groups_csv_rows(groups: list[CandidateGroup]) -> list[dict[s
                 "article_candidate_count": group.article_candidate_count,
                 "context_only_count": group.context_only_count,
                 "candidate_reasons": "; ".join(group.candidate_reasons),
+                "clean_candidate_reasons": "; ".join(group.clean_candidate_reasons),
+                "weak_candidate_reasons": "; ".join(group.weak_candidate_reasons),
                 "group_risk_flags": "; ".join(group.group_risk_flags),
+                "exclusion_reasons": "; ".join(group.exclusion_reasons),
+                "hub_node_ids": "; ".join(group.hub_node_ids),
+                "generic_aliases_matched": "; ".join(group.generic_aliases_matched),
+                "ambiguous_abbreviations": "; ".join(group.ambiguous_abbreviations),
+                "scope_conflict_reasons": "; ".join(group.scope_conflict_reasons),
                 "requires_llm_validation": group.requires_llm_validation,
                 "recommended_for_n3": group.recommended_for_n3,
                 "sample_documents": group.sample_documents,
@@ -87,8 +96,11 @@ def build_report(
 ) -> dict[str, Any]:
     all_pairs = [*candidate_pairs, *blocked_pairs, *rejected_pairs]
     priority_counts = Counter(group.group_priority for group in groups)
+    status_counts = Counter(group.candidate_group_status for group in groups)
+    quality_gate = build_quality_gate(groups)
     return {
         "stage": "normalization_n2_candidate_generation",
+        "stage_version": "n2.1",
         "created_at": created_at,
         "source_stage": "normalization_n1",
         "source_stage_version": "n1.1",
@@ -98,22 +110,86 @@ def build_report(
             "candidate_pairs_total": len(candidate_pairs),
             "high_priority_pairs": sum(1 for pair in candidate_pairs if pair.pair_status == "high_priority_candidate"),
             "blocked_pairs": len(blocked_pairs),
+            "n3_ready_pairs": sum(1 for pair in all_pairs if pair.n3_pair_ready),
+            "low_confidence_candidate_pairs": sum(1 for pair in candidate_pairs if pair.pair_status == "low_confidence_candidate"),
             "rejected_low_score_pairs": len(rejected_pairs),
             "candidate_groups_total": len(groups),
             "high_priority_groups": priority_counts.get("high", 0),
             "medium_priority_groups": priority_counts.get("medium", 0),
             "low_priority_groups": priority_counts.get("low", 0),
-            "blocked_review_groups": priority_counts.get("blocked_review", 0),
+            "n3_candidate_groups": sum(1 for group in groups if group.n3_ready),
+            "blocked_review_groups": sum(
+                1
+                for group in groups
+                if group.candidate_group_status
+                in {"blocked_review", "hub_parent_child_suspect", "ambiguous_abbreviation", "generic_alias_conflict"}
+            ),
+            "ambiguous_abbreviation_groups": status_counts.get("ambiguous_abbreviation", 0),
+            "generic_alias_conflict_groups": status_counts.get("generic_alias_conflict", 0),
+            "hub_parent_child_suspect_groups": status_counts.get("hub_parent_child_suspect", 0),
             "singleton_fast_path_candidates": sum(1 for row in singleton_fast_path_rows if row.get("recommended_fast_path")),
         },
         "counts_by_entity_type": _counts_by_entity_type(nodes, candidate_pairs, blocked_pairs, rejected_pairs, groups),
         "candidate_reason_counts": dict(
             Counter(reason for pair in all_pairs for reason in pair.candidate_reasons).most_common()
         ),
+        "clean_candidate_reason_counts": dict(
+            Counter(reason for pair in all_pairs for reason in pair.clean_candidate_reasons).most_common()
+        ),
+        "weak_candidate_reason_counts": dict(
+            Counter(reason for pair in all_pairs for reason in pair.weak_candidate_reasons).most_common()
+        ),
         "blocking_reason_counts": dict(Counter(reason for pair in blocked_pairs for reason in pair.blocking_reasons).most_common()),
         "group_risk_flag_counts": dict(Counter(flag for group in groups for flag in group.group_risk_flags).most_common()),
+        "group_status_counts": dict(status_counts.most_common()),
+        "exclusion_reason_counts": dict(
+            Counter(reason for group in groups for reason in group.exclusion_reasons).most_common()
+        ),
+        "quality_gate": quality_gate,
         "warnings": warnings,
     }
+
+
+def build_group_quality_diagnostics(groups: list[CandidateGroup]) -> dict[str, Any]:
+    n3_groups = [group for group in groups if group.n3_ready]
+    node_counts = Counter(node_id for group in n3_groups for node_id in group.node_ids)
+    return {
+        "quality_gate": build_quality_gate(groups),
+        "group_status_counts": dict(Counter(group.candidate_group_status for group in groups).most_common()),
+        "group_priority_counts": dict(Counter(group.group_priority for group in groups).most_common()),
+        "exclusion_reason_counts": dict(
+            Counter(reason for group in groups for reason in group.exclusion_reasons).most_common()
+        ),
+        "top_n3_hub_nodes": [
+            {"node_id": node_id, "n3_group_count": count}
+            for node_id, count in node_counts.most_common(25)
+        ],
+    }
+
+
+def build_quality_gate(groups: list[CandidateGroup]) -> dict[str, Any]:
+    n3_groups = [group for group in groups if group.n3_ready]
+    node_counts = Counter(node_id for group in n3_groups for node_id in group.node_ids)
+    gate = {
+        "n3_candidate_groups_total": len(n3_groups),
+        "recommended_groups_with_both_context_only": sum(
+            1 for group in n3_groups if "both_context_only" in group.group_risk_flags
+        ),
+        "recommended_groups_with_parent_child_suspect": sum(
+            1
+            for group in n3_groups
+            if "parent_child_suspect" in group.group_risk_flags or group.scope_conflict_reasons
+        ),
+        "recommended_groups_with_generic_alias_conflict": sum(
+            1 for group in n3_groups if group.generic_aliases_matched or "generic_alias_conflict" in group.group_risk_flags
+        ),
+        "recommended_groups_with_ambiguous_abbreviation": sum(
+            1 for group in n3_groups if group.ambiguous_abbreviations or "ambiguous_abbreviation" in group.group_risk_flags
+        ),
+        "nodes_in_more_than_5_n3_groups": sum(1 for count in node_counts.values() if count > 5),
+    }
+    gate["passed"] = all(value == 0 for key, value in gate.items() if key != "n3_candidate_groups_total")
+    return gate
 
 
 def _counts_by_entity_type(

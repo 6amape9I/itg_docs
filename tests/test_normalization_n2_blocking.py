@@ -50,6 +50,26 @@ class NormalizationN2BlockingTests(unittest.TestCase):
 
         self.assertIn("short_alias_ambiguous", reasons)
 
+    def test_diagnostic_method_scope_conflict_blocked(self) -> None:
+        reasons = blocking_reasons(_node("n1", "diagnostic_method", "МРТ"), _node("n2", "diagnostic_method", "МРТ гипофиза"), [])
+
+        self.assertIn("diagnostic_method_scope_conflict", reasons)
+        self.assertIn("parent_child_blocked", reasons)
+
+    def test_procedure_object_scope_conflict_blocked(self) -> None:
+        reasons = blocking_reasons(
+            _node("n1", "procedure", "Вакцинация против гепатита А"),
+            _node("n2", "procedure", "Вакцинация против желтой лихорадки"),
+            [],
+        )
+
+        self.assertIn("procedure_object_scope_conflict", reasons)
+
+    def test_disease_location_scope_conflict_blocked(self) -> None:
+        reasons = blocking_reasons(_node("n1", "disease", "Полип матки"), _node("n2", "disease", "Полип носа"), [])
+
+        self.assertIn("disease_location_conflict", reasons)
+
 
 if __name__ == "__main__":
     unittest.main()
