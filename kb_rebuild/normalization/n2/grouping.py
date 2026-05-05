@@ -5,11 +5,44 @@ from dataclasses import replace
 
 from kb_rebuild.normalization.n2.features import has_clean_reason, has_strong_reason
 from kb_rebuild.normalization.n2.models import CandidateGroup, CandidateNode, CandidatePair
+from kb_rebuild.normalization.n2.scope_conflict import (
+    cellular_conflict,
+    extract_cellular_markers,
+    extract_complex_markers,
+    extract_disease_heads,
+    extract_location_markers,
+    extract_subtype_markers,
+)
 
 
 MAX_GROUP_SIZE = 12
 MAX_BLOCKED_REVIEW_GROUPS = 5000
 HUB_N3_GROUP_LIMIT = 5
+N3_SCORE_THRESHOLD = 0.72
+HARD_ALIAS_REASONS = {
+    "primary_label_exact_match",
+    "explicit_parenthetical_alias_match",
+    "explicit_alias_exact_match",
+    "product_variant_match",
+    "canonical_alias_exact_match",
+}
+QUALITY_RISK_HARD_ALIAS_REASONS = {
+    "primary_label_exact_match",
+    "explicit_parenthetical_alias_match",
+    "explicit_alias_exact_match",
+    "canonical_alias_exact_match",
+}
+QUALITY_RISK_FLAGS = {"quote_issue", "low_confidence", "contains_short_alias", "very_short_alias", "possible_abbreviation"}
+SUBTYPE_BLOCKING_REASONS = {"disease_subtype_conflict"}
+LOCATION_SCOPE_BLOCKING_REASONS = {
+    "diagnostic_method_parent_child_scope",
+    "diagnostic_method_scope_conflict",
+    "disease_location_conflict",
+    "disease_parent_child_scope",
+    "drug_class_parent_child_scope",
+    "parent_child_blocked",
+    "procedure_object_scope_conflict",
+}
 
 
 def build_candidate_groups(
@@ -151,6 +184,20 @@ def _group_from_nodes_and_pairs(
     )
     if "both_context_only" in risks and context_only_count < mentions_count:
         risks = sorted((set(risks) - {"both_context_only"}) | {"partial_context_only_pair"})
+    group_labels = sorted({node.label for node in group_nodes if node.label})
+    marker_profile = _marker_profile(group_nodes)
+    hard_alias_reason = bool(set(clean_reasons) & HARD_ALIAS_REASONS)
+    quality_flags = _quality_gate_flags(
+        entity_type=group_nodes[0].entity_type,
+        group_labels=group_labels,
+        group_score=group_score,
+        clean_reasons=clean_reasons,
+        risks=risks,
+        scope_conflicts=scope_conflicts,
+        marker_profile=marker_profile,
+        hard_alias_reason=hard_alias_reason,
+    )
+    score_gate_passed = "score_below_n3_threshold_without_hard_alias_reason" not in quality_flags
     priority = _group_priority(
         pairs=pairs,
         group_score=group_score,
@@ -169,29 +216,39 @@ def _group_from_nodes_and_pairs(
         scope_conflicts=scope_conflicts,
         generic_aliases=generic_aliases,
         ambiguous_abbreviations=ambiguous_abbreviations,
+        quality_flags=quality_flags,
     )
     recommended = _recommended_for_n3(
         status=status,
         priority=priority,
         clean_reasons=clean_reasons,
         exclusions=exclusions,
+        score_gate_passed=score_gate_passed,
+        quality_flags=quality_flags,
     )
     documents = _sample_documents(group_nodes)
     return CandidateGroup(
         candidate_group_id=f"cg_{group_index:06d}",
         entity_type=group_nodes[0].entity_type,
-        group_labels=sorted({node.label for node in group_nodes if node.label}),
+        group_labels=group_labels,
         node_ids=node_ids,
         pair_ids=[pair.pair_id for pair in pairs],
         group_score=group_score,
         group_priority=priority,
         candidate_group_status=status,
         n3_ready=recommended,
+        hard_alias_reason=hard_alias_reason,
+        score_gate_passed=score_gate_passed,
         candidate_reasons=reasons,
         clean_candidate_reasons=clean_reasons,
         weak_candidate_reasons=weak_reasons,
         group_risk_flags=risks,
         exclusion_reasons=exclusions,
+        subtype_markers=marker_profile["subtype_markers"],
+        location_markers=marker_profile["location_markers"],
+        cellular_markers=marker_profile["cellular_markers"],
+        complex_markers=marker_profile["complex_markers"],
+        quality_gate_flags=quality_flags,
         hub_node_ids=[],
         generic_aliases_matched=generic_aliases,
         ambiguous_abbreviations=ambiguous_abbreviations,
@@ -241,17 +298,30 @@ def _group_status_and_exclusions(
     scope_conflicts: list[str],
     generic_aliases: list[str],
     ambiguous_abbreviations: list[str],
+    quality_flags: list[str],
 ) -> tuple[str, list[str]]:
     exclusions: set[str] = set()
     blocking = {reason for pair in pairs for reason in pair.blocking_reasons}
+    exclusions.update(quality_flags)
+    if blocking & SUBTYPE_BLOCKING_REASONS:
+        exclusions.update(blocking & SUBTYPE_BLOCKING_REASONS)
+        return "subtype_conflict", sorted(exclusions)
+    if _has_subtype_conflict(quality_flags):
+        return "subtype_conflict", sorted(exclusions)
+    if blocking & LOCATION_SCOPE_BLOCKING_REASONS:
+        exclusions.update(blocking & LOCATION_SCOPE_BLOCKING_REASONS)
+        return "location_scope_conflict", sorted(exclusions)
+    if _has_location_scope_conflict(quality_flags) or scope_conflicts:
+        exclusions.update(scope_conflicts)
+        return "location_scope_conflict", sorted(exclusions)
     if blocked or blocking:
         exclusions.update(blocking or {"blocked_pair"})
         if scope_conflicts or "parent_child_suspect" in blocking or "parent_child_blocked" in blocking:
-            return "hub_parent_child_suspect", sorted(exclusions)
+            return "location_scope_conflict", sorted(exclusions)
         return "blocked_review", sorted(exclusions)
-    if scope_conflicts or "parent_child_suspect" in risks:
-        exclusions.update(scope_conflicts or {"parent_child_suspect"})
-        return "hub_parent_child_suspect", sorted(exclusions)
+    if "parent_child_suspect" in risks:
+        exclusions.add("parent_child_suspect")
+        return "location_scope_conflict", sorted(exclusions)
     if ambiguous_abbreviations or "ambiguous_abbreviation" in risks:
         exclusions.add("ambiguous_abbreviation")
         return "ambiguous_abbreviation", sorted(exclusions)
@@ -264,6 +334,12 @@ def _group_status_and_exclusions(
         exclusions.add("no_clean_candidate_reason")
     if priority not in {"high", "medium"}:
         exclusions.add("low_priority")
+    if set(exclusions) & {
+        "score_below_n3_threshold_without_hard_alias_reason",
+        "quality_risk_without_hard_alias_reason",
+        "disease_modifier_mismatch",
+    }:
+        return "quality_score_rejected", sorted(exclusions)
     if exclusions:
         return "low_confidence_candidate", sorted(exclusions)
     return "n3_candidate", []
@@ -275,8 +351,124 @@ def _recommended_for_n3(
     priority: str,
     clean_reasons: list[str],
     exclusions: list[str],
+    score_gate_passed: bool,
+    quality_flags: list[str],
 ) -> bool:
-    return status == "n3_candidate" and priority in {"high", "medium"} and has_clean_reason(clean_reasons) and not exclusions
+    return (
+        status == "n3_candidate"
+        and priority in {"high", "medium"}
+        and has_clean_reason(clean_reasons)
+        and score_gate_passed
+        and not quality_flags
+        and not exclusions
+    )
+
+
+def _marker_profile(group_nodes: list[CandidateNode]) -> dict[str, list[str]]:
+    if not group_nodes or group_nodes[0].entity_type != "disease":
+        return {
+            "subtype_markers": [],
+            "location_markers": [],
+            "cellular_markers": [],
+            "complex_markers": [],
+            "disease_heads": [],
+            "labels_with_subtype_count": 0,
+            "labels_without_subtype_count": 0,
+            "labels_with_location_count": 0,
+            "labels_without_location_count": 0,
+        }
+    subtype_sets = [extract_subtype_markers(node.label) for node in group_nodes]
+    location_sets = [extract_location_markers(node.label) for node in group_nodes]
+    cellular_sets = [extract_cellular_markers(node.label) for node in group_nodes]
+    complex_sets = [extract_complex_markers(node.label) for node in group_nodes]
+    head_sets = [extract_disease_heads(node.label) for node in group_nodes]
+    subtype_markers = sorted({marker for markers in subtype_sets for marker in markers if not marker.startswith("complex_")})
+    location_markers = sorted({marker for markers in location_sets for marker in markers})
+    cellular_markers = sorted({marker for markers in cellular_sets for marker in markers})
+    complex_markers = sorted({marker for markers in complex_sets for marker in markers})
+    disease_heads = sorted({marker for markers in head_sets for marker in markers})
+    return {
+        "subtype_markers": subtype_markers,
+        "location_markers": location_markers,
+        "cellular_markers": cellular_markers,
+        "complex_markers": complex_markers,
+        "disease_heads": disease_heads,
+        "labels_with_subtype_count": sum(1 for markers in subtype_sets if markers),
+        "labels_without_subtype_count": sum(1 for markers in subtype_sets if not markers),
+        "labels_with_location_count": sum(1 for markers in location_sets if markers),
+        "labels_without_location_count": sum(1 for markers in location_sets if not markers),
+    }
+
+
+def _quality_gate_flags(
+    *,
+    entity_type: str,
+    group_labels: list[str],
+    group_score: float,
+    clean_reasons: list[str],
+    risks: list[str],
+    scope_conflicts: list[str],
+    marker_profile: dict[str, list[str] | int],
+    hard_alias_reason: bool,
+) -> list[str]:
+    flags: set[str] = set()
+    hard_conflicts: set[str] = set(scope_conflicts)
+    if entity_type == "disease":
+        subtype_markers = set(marker_profile["subtype_markers"])  # type: ignore[arg-type]
+        location_markers = set(marker_profile["location_markers"])  # type: ignore[arg-type]
+        cellular_markers = set(marker_profile["cellular_markers"])  # type: ignore[arg-type]
+        complex_markers = set(marker_profile["complex_markers"])  # type: ignore[arg-type]
+        disease_heads = set(marker_profile["disease_heads"])  # type: ignore[arg-type]
+        if len(subtype_markers) > 1:
+            flags.add("different_subtype_values_inside_group")
+        if marker_profile["labels_with_subtype_count"] and marker_profile["labels_without_subtype_count"]:  # type: ignore[index]
+            flags.add("base_vs_subtype_conflict")
+        if cellular_conflict(cellular_markers):
+            flags.add("cellular_subtype_conflict")
+        if len(complex_markers) > 1:
+            flags.add("complex_subtype_conflict")
+        if disease_heads and len(location_markers) > 1:
+            flags.add("disease_location_conflict")
+        if disease_heads and marker_profile["labels_with_location_count"] and marker_profile["labels_without_location_count"]:  # type: ignore[index]
+            flags.add("disease_parent_child_scope")
+    hard_conflicts.update(
+        flag
+        for flag in flags
+        if flag
+        in {
+            "different_subtype_values_inside_group",
+            "base_vs_subtype_conflict",
+            "cellular_subtype_conflict",
+            "complex_subtype_conflict",
+            "disease_location_conflict",
+            "disease_parent_child_scope",
+        }
+    )
+    if group_score < N3_SCORE_THRESHOLD and (not hard_alias_reason or hard_conflicts):
+        flags.add("score_below_n3_threshold_without_hard_alias_reason")
+    quality_risks = QUALITY_RISK_FLAGS & set(risks)
+    has_quality_risk_alias_reason = bool(set(clean_reasons) & QUALITY_RISK_HARD_ALIAS_REASONS)
+    if quality_risks and not has_quality_risk_alias_reason:
+        flags.add("quality_risk_without_hard_alias_reason")
+    if "disease_modifier_mismatch" in risks and (not hard_alias_reason or hard_conflicts):
+        flags.add("disease_modifier_mismatch")
+    return sorted(flags)
+
+
+def _has_subtype_conflict(flags: list[str]) -> bool:
+    return bool(
+        set(flags)
+        & {
+            "different_subtype_values_inside_group",
+            "base_vs_subtype_conflict",
+            "cellular_subtype_conflict",
+            "complex_subtype_conflict",
+        }
+    )
+
+
+def _has_location_scope_conflict(flags: list[str]) -> bool:
+    return bool(set(flags) & {"disease_location_conflict", "disease_parent_child_scope"})
 
 
 def _apply_hub_protection(groups: list[CandidateGroup]) -> list[CandidateGroup]:
@@ -300,6 +492,7 @@ def _apply_hub_protection(groups: list[CandidateGroup]) -> list[CandidateGroup]:
                     n3_ready=False,
                     recommended_for_n3=False,
                     hub_node_ids=group_hubs,
+                    quality_gate_flags=sorted(set(group.quality_gate_flags) | {"hub_parent_child_suspect"}),
                     exclusion_reasons=exclusions,
                 )
             )

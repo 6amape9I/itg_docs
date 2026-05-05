@@ -134,18 +134,28 @@ def _pair(
     weak_reasons: list[str] | None = None,
     risks: list[str] | None = None,
     blocking: list[str] | None = None,
+    score: float = 0.9,
+    entity_type: str | None = None,
 ) -> CandidatePair:
     candidate_reasons = reasons or ["high_sequence_similarity"]
     inferred_clean = clean_reasons if clean_reasons is not None else _clean_reasons_for(candidate_reasons)
     blocking_reasons = blocking or []
+    if entity_type:
+        inferred_entity_type = entity_type
+    elif "ИФА" in right_label:
+        inferred_entity_type = "diagnostic_method"
+    elif left_label in {"A", "B"}:
+        inferred_entity_type = "disease"
+    else:
+        inferred_entity_type = "microorganism"
     return CandidatePair(
         pair_id=pair_id,
         left_node_id=left,
         right_node_id=right,
-        entity_type="diagnostic_method" if "ИФА" in right_label else "disease" if left_label in {"A", "B"} else "microorganism",
+        entity_type=inferred_entity_type,
         left_label=left_label,
         right_label=right_label,
-        score=0.9,
+        score=score,
         pair_status=status,
         candidate_reasons=candidate_reasons,
         clean_candidate_reasons=inferred_clean,

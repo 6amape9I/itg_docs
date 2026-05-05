@@ -35,6 +35,10 @@ class NormalizationN2RunnerTests(unittest.TestCase):
                 "ambiguous_abbreviation_groups.csv",
                 "hub_parent_child_suspects.csv",
                 "generic_alias_conflicts.csv",
+                "subtype_conflict_groups.csv",
+                "location_scope_conflict_groups.csv",
+                "quality_score_rejected_groups.csv",
+                "known_bad_n3_matches.csv",
                 "group_quality_diagnostics.json",
                 "singleton_fast_path_candidates.csv",
                 "candidate_generation_report.json",
@@ -42,16 +46,18 @@ class NormalizationN2RunnerTests(unittest.TestCase):
             ):
                 self.assertTrue((out / filename).exists(), filename)
             self.assertEqual(report["source_stage_version"], "n1.1")
-            self.assertEqual(report["stage_version"], "n2.1")
+            self.assertEqual(report["stage_version"], "n2.2")
             self.assertEqual(report["counts"]["nodes_total"], 2)
             self.assertEqual(report["counts"]["candidate_pairs_total"], 1)
             self.assertEqual(report["counts"]["n3_candidate_groups"], 1)
             self.assertTrue(report["quality_gate"]["passed"])
+            self.assertIn("n3_groups_matching_known_bad_examples", report["quality_gate"])
             self.assertEqual(len(read_jsonl(out / "candidate_groups.jsonl")), 1)
             self.assertEqual(len(read_jsonl(out / "n3_candidate_groups.jsonl")), 1)
             manifest = json.loads((out / "candidate_generation_manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["stage_version"], "n2.1")
+            self.assertEqual(manifest["stage_version"], "n2.2")
             self.assertIn("n3_candidate_groups_jsonl", manifest["outputs"])
+            self.assertIn("known_bad_n3_matches_csv", manifest["outputs"])
 
     def test_runner_refuses_non_n1_1_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -88,11 +94,11 @@ def _write_n1_inputs(norm_dir: Path, *, stage_version: str = "n1.1") -> None:
         encoding="utf-8",
     )
     clusters = [
-        _cluster("ac_000001", "diagnostic_method", "Иммуноферментный анализ", ["Иммуноферментный анализ"], ["m1"]),
+        _cluster("ac_000001", "diagnostic_method", "Иммуноферментный анализ (ИФА)", ["Иммуноферментный анализ (ИФА)"], ["m1"]),
         _cluster("ac_000002", "diagnostic_method", "ИФА", ["ИФА"], ["m2"]),
     ]
     mentions = [
-        _mention("m1", "doc_1", "Иммуноферментный анализ"),
+        _mention("m1", "doc_1", "Иммуноферментный анализ (ИФА)"),
         _mention("m2", "doc_2", "ИФА"),
     ]
     singletons = [

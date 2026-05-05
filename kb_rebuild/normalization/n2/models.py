@@ -125,11 +125,18 @@ class CandidateGroup:
     group_priority: str
     candidate_group_status: str
     n3_ready: bool
+    hard_alias_reason: bool
+    score_gate_passed: bool
     candidate_reasons: list[str]
     clean_candidate_reasons: list[str]
     weak_candidate_reasons: list[str]
     group_risk_flags: list[str]
     exclusion_reasons: list[str]
+    subtype_markers: list[str]
+    location_markers: list[str]
+    cellular_markers: list[str]
+    complex_markers: list[str]
+    quality_gate_flags: list[str]
     hub_node_ids: list[str]
     generic_aliases_matched: list[str]
     ambiguous_abbreviations: list[str]
@@ -153,11 +160,18 @@ class CandidateGroup:
             "group_priority": self.group_priority,
             "candidate_group_status": self.candidate_group_status,
             "n3_ready": self.n3_ready,
+            "hard_alias_reason": self.hard_alias_reason,
+            "score_gate_passed": self.score_gate_passed,
             "candidate_reasons": self.candidate_reasons,
             "clean_candidate_reasons": self.clean_candidate_reasons,
             "weak_candidate_reasons": self.weak_candidate_reasons,
             "group_risk_flags": self.group_risk_flags,
             "exclusion_reasons": self.exclusion_reasons,
+            "subtype_markers": self.subtype_markers,
+            "location_markers": self.location_markers,
+            "cellular_markers": self.cellular_markers,
+            "complex_markers": self.complex_markers,
+            "quality_gate_flags": self.quality_gate_flags,
             "hub_node_ids": self.hub_node_ids,
             "generic_aliases_matched": self.generic_aliases_matched,
             "ambiguous_abbreviations": self.ambiguous_abbreviations,

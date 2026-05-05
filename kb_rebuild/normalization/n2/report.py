@@ -7,6 +7,29 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from kb_rebuild.normalization.n2.models import CandidateGroup, CandidateNode, CandidatePair
+from kb_rebuild.normalization.text import normalize_basic_text
+
+
+KNOWN_BAD_N3_EXAMPLES = (
+    ("Детская герминогенная опухоль яичка", "Детская герминогенная опухоль яичника"),
+    ("Дефицит кофактора молибдена тип A", "Дефицит кофактора молибдена тип B"),
+    ("Дефицит кофактора молибдена тип A", "Дефицит кофактора молибдена тип C"),
+    ("Катаракта 2 множественных типов", "Катаракта 3 множественных типов"),
+    ("Детский В-клеточный острый лимфобластный лейкоз", "Детский Т-клеточный острый лимфобластный лейкоз"),
+    ("Врожденный гипотиреоз", "Герпетический энцефалит"),
+    ("Анемия хронических заболеваний", "Желудочковые аритмии"),
+    ("Рентгенография позвоночника", "Рентгенологическое исследование"),
+    ("КТ и МРТ орбиты", "Магнитно-резонансная томография"),
+)
+REVIEW_GROUP_STATUSES = {
+    "blocked_review",
+    "hub_parent_child_suspect",
+    "ambiguous_abbreviation",
+    "generic_alias_conflict",
+    "subtype_conflict",
+    "location_scope_conflict",
+    "quality_score_rejected",
+}
 
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
@@ -43,6 +66,8 @@ def build_candidate_groups_csv_rows(groups: list[CandidateGroup]) -> list[dict[s
                 "candidate_group_status": group.candidate_group_status,
                 "n3_ready": group.n3_ready,
                 "group_score": group.group_score,
+                "hard_alias_reason": group.hard_alias_reason,
+                "score_gate_passed": group.score_gate_passed,
                 "group_labels": " | ".join(group.group_labels),
                 "node_ids": "; ".join(group.node_ids),
                 "mentions_count": group.mentions_count,
@@ -54,6 +79,11 @@ def build_candidate_groups_csv_rows(groups: list[CandidateGroup]) -> list[dict[s
                 "weak_candidate_reasons": "; ".join(group.weak_candidate_reasons),
                 "group_risk_flags": "; ".join(group.group_risk_flags),
                 "exclusion_reasons": "; ".join(group.exclusion_reasons),
+                "subtype_markers": "; ".join(group.subtype_markers),
+                "location_markers": "; ".join(group.location_markers),
+                "cellular_markers": "; ".join(group.cellular_markers),
+                "complex_markers": "; ".join(group.complex_markers),
+                "quality_gate_flags": "; ".join(group.quality_gate_flags),
                 "hub_node_ids": "; ".join(group.hub_node_ids),
                 "generic_aliases_matched": "; ".join(group.generic_aliases_matched),
                 "ambiguous_abbreviations": "; ".join(group.ambiguous_abbreviations),
@@ -93,14 +123,15 @@ def build_report(
     groups: list[CandidateGroup],
     singleton_fast_path_rows: list[dict[str, Any]],
     warnings: list[str],
+    known_bad_matches: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     all_pairs = [*candidate_pairs, *blocked_pairs, *rejected_pairs]
     priority_counts = Counter(group.group_priority for group in groups)
     status_counts = Counter(group.candidate_group_status for group in groups)
-    quality_gate = build_quality_gate(groups)
+    quality_gate = build_quality_gate(groups, known_bad_matches=known_bad_matches)
     return {
         "stage": "normalization_n2_candidate_generation",
-        "stage_version": "n2.1",
+        "stage_version": "n2.2",
         "created_at": created_at,
         "source_stage": "normalization_n1",
         "source_stage_version": "n1.1",
@@ -121,12 +152,15 @@ def build_report(
             "blocked_review_groups": sum(
                 1
                 for group in groups
-                if group.candidate_group_status
-                in {"blocked_review", "hub_parent_child_suspect", "ambiguous_abbreviation", "generic_alias_conflict"}
+                if group.candidate_group_status in REVIEW_GROUP_STATUSES
             ),
             "ambiguous_abbreviation_groups": status_counts.get("ambiguous_abbreviation", 0),
             "generic_alias_conflict_groups": status_counts.get("generic_alias_conflict", 0),
             "hub_parent_child_suspect_groups": status_counts.get("hub_parent_child_suspect", 0),
+            "subtype_conflict_groups": status_counts.get("subtype_conflict", 0),
+            "location_scope_conflict_groups": status_counts.get("location_scope_conflict", 0),
+            "quality_score_rejected_groups": status_counts.get("quality_score_rejected", 0),
+            "known_bad_n3_matches": len(known_bad_matches or []),
             "singleton_fast_path_candidates": sum(1 for row in singleton_fast_path_rows if row.get("recommended_fast_path")),
         },
         "counts_by_entity_type": _counts_by_entity_type(nodes, candidate_pairs, blocked_pairs, rejected_pairs, groups),
@@ -150,16 +184,21 @@ def build_report(
     }
 
 
-def build_group_quality_diagnostics(groups: list[CandidateGroup]) -> dict[str, Any]:
+def build_group_quality_diagnostics(
+    groups: list[CandidateGroup],
+    known_bad_matches: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     n3_groups = [group for group in groups if group.n3_ready]
     node_counts = Counter(node_id for group in n3_groups for node_id in group.node_ids)
     return {
-        "quality_gate": build_quality_gate(groups),
+        "quality_gate": build_quality_gate(groups, known_bad_matches=known_bad_matches),
         "group_status_counts": dict(Counter(group.candidate_group_status for group in groups).most_common()),
         "group_priority_counts": dict(Counter(group.group_priority for group in groups).most_common()),
         "exclusion_reason_counts": dict(
             Counter(reason for group in groups for reason in group.exclusion_reasons).most_common()
         ),
+        "quality_gate_flag_counts": dict(Counter(flag for group in groups for flag in group.quality_gate_flags).most_common()),
+        "known_bad_n3_matches": known_bad_matches or [],
         "top_n3_hub_nodes": [
             {"node_id": node_id, "n3_group_count": count}
             for node_id, count in node_counts.most_common(25)
@@ -167,29 +206,81 @@ def build_group_quality_diagnostics(groups: list[CandidateGroup]) -> dict[str, A
     }
 
 
-def build_quality_gate(groups: list[CandidateGroup]) -> dict[str, Any]:
+def build_quality_gate(
+    groups: list[CandidateGroup],
+    known_bad_matches: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     n3_groups = [group for group in groups if group.n3_ready]
     node_counts = Counter(node_id for group in n3_groups for node_id in group.node_ids)
+    matches = known_bad_matches if known_bad_matches is not None else find_known_bad_n3_matches(groups)
     gate = {
         "n3_candidate_groups_total": len(n3_groups),
-        "recommended_groups_with_both_context_only": sum(
-            1 for group in n3_groups if "both_context_only" in group.group_risk_flags
-        ),
-        "recommended_groups_with_parent_child_suspect": sum(
+        "n3_groups_with_score_below_0_72_without_hard_alias_reason": sum(
             1
             for group in n3_groups
-            if "parent_child_suspect" in group.group_risk_flags or group.scope_conflict_reasons
+            if (group.group_score < 0.72 and not group.hard_alias_reason)
+            or "score_below_n3_threshold_without_hard_alias_reason" in group.quality_gate_flags
         ),
-        "recommended_groups_with_generic_alias_conflict": sum(
-            1 for group in n3_groups if group.generic_aliases_matched or "generic_alias_conflict" in group.group_risk_flags
+        "n3_disease_groups_with_multiple_type_values": sum(
+            1
+            for group in n3_groups
+            if group.entity_type == "disease" and "different_subtype_values_inside_group" in group.quality_gate_flags
         ),
-        "recommended_groups_with_ambiguous_abbreviation": sum(
-            1 for group in n3_groups if group.ambiguous_abbreviations or "ambiguous_abbreviation" in group.group_risk_flags
+        "n3_disease_groups_with_base_vs_subtype_conflict": sum(
+            1 for group in n3_groups if group.entity_type == "disease" and "base_vs_subtype_conflict" in group.quality_gate_flags
         ),
+        "n3_groups_with_disease_location_conflict": sum(
+            1
+            for group in n3_groups
+            if "disease_location_conflict" in group.quality_gate_flags
+            or "disease_location_conflict" in group.scope_conflict_reasons
+            or "disease_location_conflict" in group.group_risk_flags
+        ),
+        "n3_groups_with_cellular_subtype_conflict": sum(
+            1 for group in n3_groups if "cellular_subtype_conflict" in group.quality_gate_flags
+        ),
+        "n3_groups_with_complex_subtype_conflict": sum(
+            1 for group in n3_groups if "complex_subtype_conflict" in group.quality_gate_flags
+        ),
+        "n3_groups_with_disease_modifier_mismatch": sum(
+            1
+            for group in n3_groups
+            if "disease_modifier_mismatch" in group.quality_gate_flags
+        ),
+        "n3_groups_with_quality_risk_without_hard_alias_reason": sum(
+            1 for group in n3_groups if "quality_risk_without_hard_alias_reason" in group.quality_gate_flags
+        ),
+        "n3_groups_matching_known_bad_examples": len(matches),
         "nodes_in_more_than_5_n3_groups": sum(1 for count in node_counts.values() if count > 5),
     }
     gate["passed"] = all(value == 0 for key, value in gate.items() if key != "n3_candidate_groups_total")
     return gate
+
+
+def find_known_bad_n3_matches(groups: list[CandidateGroup]) -> list[dict[str, Any]]:
+    examples = [
+        {
+            "display": " | ".join(example),
+            "normalized": {normalize_basic_text(label) for label in example},
+        }
+        for example in KNOWN_BAD_N3_EXAMPLES
+    ]
+    matches: list[dict[str, Any]] = []
+    for group in groups:
+        if not group.n3_ready:
+            continue
+        group_label_norms = {normalize_basic_text(label) for label in group.group_labels}
+        for example in examples:
+            if example["normalized"] <= group_label_norms:
+                matches.append(
+                    {
+                        "candidate_group_id": group.candidate_group_id,
+                        "matched_bad_example": example["display"],
+                        "group_labels": " | ".join(group.group_labels),
+                        "reason": "known_bad_n3_pattern",
+                    }
+                )
+    return matches
 
 
 def _counts_by_entity_type(

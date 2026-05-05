@@ -15,6 +15,7 @@ from kb_rebuild.normalization.n2.report import (
     build_group_quality_diagnostics,
     build_report,
     build_singleton_fast_path_rows,
+    find_known_bad_n3_matches,
     write_csv,
     write_json,
 )
@@ -67,10 +68,24 @@ OUTPUT_FILENAMES = {
     "ambiguous_abbreviation_groups_csv": "ambiguous_abbreviation_groups.csv",
     "hub_parent_child_suspects_csv": "hub_parent_child_suspects.csv",
     "generic_alias_conflicts_csv": "generic_alias_conflicts.csv",
+    "subtype_conflict_groups_csv": "subtype_conflict_groups.csv",
+    "location_scope_conflict_groups_csv": "location_scope_conflict_groups.csv",
+    "quality_score_rejected_groups_csv": "quality_score_rejected_groups.csv",
+    "known_bad_n3_matches_csv": "known_bad_n3_matches.csv",
     "group_quality_diagnostics_json": "group_quality_diagnostics.json",
     "singleton_fast_path_candidates_csv": "singleton_fast_path_candidates.csv",
     "candidate_generation_report": "candidate_generation_report.json",
     "candidate_generation_manifest": "candidate_generation_manifest.json",
+}
+
+REVIEW_GROUP_STATUSES = {
+    "blocked_review",
+    "hub_parent_child_suspect",
+    "ambiguous_abbreviation",
+    "generic_alias_conflict",
+    "subtype_conflict",
+    "location_scope_conflict",
+    "quality_score_rejected",
 }
 
 
@@ -120,12 +135,8 @@ class NormalizationN2Runner:
 
         singleton_rows = build_singleton_fast_path_rows(singletons)
         n3_groups = [group for group in groups if group.n3_ready and group.recommended_for_n3 and group.requires_llm_validation]
-        blocked_review_groups = [
-            group
-            for group in groups
-            if group.candidate_group_status
-            in {"blocked_review", "hub_parent_child_suspect", "ambiguous_abbreviation", "generic_alias_conflict"}
-        ]
+        blocked_review_groups = [group for group in groups if group.candidate_group_status in REVIEW_GROUP_STATUSES]
+        known_bad_matches = find_known_bad_n3_matches(n3_groups)
         self.config.out_dir.mkdir(parents=True, exist_ok=True)
         write_jsonl(self.paths["candidate_nodes"], (node.to_dict() for node in nodes))
         write_jsonl(self.paths["candidate_pairs"], (pair.to_dict() for pair in candidate_pairs))
@@ -145,6 +156,8 @@ class NormalizationN2Runner:
             "candidate_group_status",
             "n3_ready",
             "group_score",
+            "hard_alias_reason",
+            "score_gate_passed",
             "group_labels",
             "node_ids",
             "mentions_count",
@@ -156,6 +169,11 @@ class NormalizationN2Runner:
             "weak_candidate_reasons",
             "group_risk_flags",
             "exclusion_reasons",
+            "subtype_markers",
+            "location_markers",
+            "cellular_markers",
+            "complex_markers",
+            "quality_gate_flags",
             "hub_node_ids",
             "generic_aliases_matched",
             "ambiguous_abbreviations",
@@ -192,6 +210,26 @@ class NormalizationN2Runner:
             group_fields,
             [row for row in group_rows if row.get("candidate_group_status") == "generic_alias_conflict"],
         )
+        write_csv(
+            self.paths["subtype_conflict_groups_csv"],
+            group_fields,
+            [row for row in group_rows if row.get("candidate_group_status") == "subtype_conflict"],
+        )
+        write_csv(
+            self.paths["location_scope_conflict_groups_csv"],
+            group_fields,
+            [row for row in group_rows if row.get("candidate_group_status") == "location_scope_conflict"],
+        )
+        write_csv(
+            self.paths["quality_score_rejected_groups_csv"],
+            group_fields,
+            [row for row in group_rows if row.get("candidate_group_status") == "quality_score_rejected"],
+        )
+        write_csv(
+            self.paths["known_bad_n3_matches_csv"],
+            ["candidate_group_id", "matched_bad_example", "group_labels", "reason"],
+            known_bad_matches,
+        )
         singleton_fields = [
             "candidate_id",
             "doc_id",
@@ -225,9 +263,13 @@ class NormalizationN2Runner:
             groups=groups,
             singleton_fast_path_rows=singleton_rows,
             warnings=warnings,
+            known_bad_matches=known_bad_matches,
         )
         write_json(self.paths["candidate_generation_report"], report)
-        write_json(self.paths["group_quality_diagnostics_json"], build_group_quality_diagnostics(groups))
+        write_json(
+            self.paths["group_quality_diagnostics_json"],
+            build_group_quality_diagnostics(groups, known_bad_matches=known_bad_matches),
+        )
         write_json(self.paths["candidate_generation_manifest"], self._build_manifest(created_at))
         return report
 
@@ -266,19 +308,13 @@ class NormalizationN2Runner:
         for group in groups:
             if len(group.node_ids) < 2:
                 raise ValueError(f"{group.candidate_group_id}: candidate group has fewer than 2 nodes")
-            if group.candidate_group_status not in {
-                "blocked_review",
-                "hub_parent_child_suspect",
-                "ambiguous_abbreviation",
-                "generic_alias_conflict",
-            } and any(pair_id in blocked_pair_ids for pair_id in group.pair_ids):
+            if group.candidate_group_status not in REVIEW_GROUP_STATUSES and any(
+                pair_id in blocked_pair_ids for pair_id in group.pair_ids
+            ):
                 raise ValueError(f"{group.candidate_group_id}: blocked pair entered a normal candidate group")
-            if group.candidate_group_status not in {
-                "blocked_review",
-                "hub_parent_child_suspect",
-                "ambiguous_abbreviation",
-                "generic_alias_conflict",
-            } and any(pair_id not in candidate_pair_ids for pair_id in group.pair_ids):
+            if group.candidate_group_status not in REVIEW_GROUP_STATUSES and any(
+                pair_id not in candidate_pair_ids for pair_id in group.pair_ids
+            ):
                 raise ValueError(f"{group.candidate_group_id}: normal group references non-candidate pair")
             if group.n3_ready and group.candidate_group_status != "n3_candidate":
                 raise ValueError(f"{group.candidate_group_id}: n3_ready group has non-n3 status")
@@ -286,7 +322,7 @@ class NormalizationN2Runner:
     def _build_manifest(self, created_at: str) -> dict[str, Any]:
         return {
             "stage": "normalization_n2_candidate_generation",
-            "stage_version": "n2.1",
+            "stage_version": "n2.2",
             "created_at": created_at,
             "source_normalization_manifest": str(self.inputs["normalization_manifest"]),
             "source_stage_version": "n1.1",

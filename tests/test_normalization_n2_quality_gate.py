@@ -44,7 +44,7 @@ class NormalizationN2QualityGateTests(unittest.TestCase):
 
         self.assertTrue(gate["passed"])
         self.assertEqual(gate["n3_candidate_groups_total"], 0)
-        self.assertEqual(groups[0].candidate_group_status, "hub_parent_child_suspect")
+        self.assertEqual(groups[0].candidate_group_status, "location_scope_conflict")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from kb_rebuild.normalization.n2.features import has_strong_reason, short_alias, tokens
+from kb_rebuild.normalization.n2.features import has_strong_reason, parenthetical_aliases, short_alias, tokens
 from kb_rebuild.normalization.n2.models import CandidateNode
 from kb_rebuild.normalization.n2.scope_conflict import scope_conflict_reasons
 from kb_rebuild.normalization.text import is_latin_only, normalize_basic_text
@@ -78,6 +78,8 @@ def _parent_child_suspect(left: CandidateNode, right: CandidateNode) -> bool:
     left_tokens = tokens(left_label)
     right_tokens = tokens(right_label)
     if not left_tokens or not right_tokens:
+        return False
+    if left_label in parenthetical_aliases(right) or right_label in parenthetical_aliases(left):
         return False
     left_set = set(left_tokens)
     right_set = set(right_tokens)
