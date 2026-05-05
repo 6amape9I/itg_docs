@@ -20,6 +20,7 @@ from kb_rebuild.llm.models import (
 from kb_rebuild.llm.openrouter_client import OpenRouterClient, load_dotenv_openrouter_key
 from kb_rebuild.llm.tagging_batch import BatchTaggingConfig, run_batch_tagging_calibration
 from kb_rebuild.llm.tagging import TaggingConfig, run_tagging_calibration
+from kb_rebuild.normalization.n1_runner import N1Config, run_normalization_n1
 from kb_rebuild.parsing.documents import parse_csv_documents
 from kb_rebuild.parsing.validate import validate_parsed_artifacts
 from kb_rebuild.reports.run_report import RunReport, write_run_report
@@ -142,6 +143,16 @@ def build_parser() -> argparse.ArgumentParser:
     gemini_models_parser.add_argument("--data", default="data", help="Data directory for report artifacts")
     gemini_models_parser.add_argument("--timeout-seconds", type=_non_negative_int, default=0, help="0 disables urllib timeout")
     gemini_models_parser.set_defaults(func=run_gemini_list_models)
+
+    normalize_n1_parser = subparsers.add_parser("normalize-n1", help="Run deterministic N1 tag normalization")
+    normalize_n1_parser.add_argument("--data", default="data", help="Data directory with tagging artifacts")
+    normalize_n1_parser.add_argument("--tagging-active-path", default=None, help="Path to active tagging success JSONL")
+    normalize_n1_parser.add_argument("--failures-path", default=None, help="Path to active tagging failures JSONL")
+    normalize_n1_parser.add_argument("--empty-candidates-path", default=None, help="Path to empty document candidates JSONL")
+    normalize_n1_parser.add_argument("--out", default=None, help="Output normalization directory")
+    normalize_n1_parser.add_argument("--min-mentions-for-report", type=_positive_int, default=1)
+    normalize_n1_parser.add_argument("--no-overwrite", action="store_true", help="Fail if any N1 output already exists")
+    normalize_n1_parser.set_defaults(func=run_normalize_n1)
 
     return parser
 
@@ -474,6 +485,52 @@ def run_gemini_list_models(args: argparse.Namespace) -> int:
     models_count = len(models) if isinstance(models, list) else 0
     logger.info("Gemini model discovery finished models=%s raw=%s markdown=%s", models_count, raw_path, markdown_path)
     print(f"Gemini model discovery complete: models={models_count} raw={raw_path} report={markdown_path}")
+    return 0
+
+
+def run_normalize_n1(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data)
+    logger = configure_logging(data_dir)
+    config = N1Config.from_data_dir(
+        data_dir,
+        tagging_active_path=Path(args.tagging_active_path) if args.tagging_active_path else None,
+        failures_path=Path(args.failures_path) if args.failures_path else None,
+        empty_candidates_path=Path(args.empty_candidates_path) if args.empty_candidates_path else None,
+        out_dir=Path(args.out) if args.out else None,
+        min_mentions_for_report=args.min_mentions_for_report,
+        overwrite=not args.no_overwrite,
+    )
+    logger.info(
+        "normalization N1 started data_dir=%s tagging_active=%s failures=%s empty_candidates=%s out=%s",
+        config.data_dir,
+        config.tagging_active_path,
+        config.failures_path,
+        config.empty_candidates_path,
+        config.out_dir,
+    )
+    try:
+        report = run_normalization_n1(config)
+    except Exception as exc:
+        logger.exception("normalization N1 failed")
+        print(f"Normalization N1 failed: {exc}")
+        return 1
+
+    counts = report.get("counts", {})
+    logger.info("normalization N1 finished counts=%s", counts)
+    print(
+        "Normalization N1 complete: "
+        f"mentions={counts.get('mentions_total', 0)} "
+        f"unique_norm={counts.get('unique_normalized_values', 0)} "
+        f"auto_clusters={counts.get('auto_clusters_total', 0)} "
+        f"review_required={counts.get('auto_clusters_review_required', 0)} "
+        f"suspicious={counts.get('suspicious_mentions', 0)} "
+        f"out={config.out_dir}"
+    )
+    warnings = report.get("warnings", [])
+    for warning in warnings[:10]:
+        print(f"WARNING: {warning}")
+    if len(warnings) > 10:
+        print(f"WARNING: {len(warnings) - 10} more warnings in normalization_n1_report.json")
     return 0
 
 
