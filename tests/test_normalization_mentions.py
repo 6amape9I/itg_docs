@@ -85,6 +85,28 @@ class NormalizationMentionsTests(unittest.TestCase):
         self.assertEqual(normalized.normalized["primary_norm"], "ифа")
         self.assertIn("empty_canonical_candidate_ru", normalized.suspicious_flags)
         self.assertIn("quote_not_found", normalized.suspicious_flags)
+        self.assertIn("quote_not_found", normalized.risk_flags)
+        self.assertIn("article_candidate", normalized.routing_flags)
+
+    def test_context_only_is_routing_not_risk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tags.jsonl"
+            path.write_text(
+                '{"doc_id":"doc_1","document_name":"Желудок","entities":['
+                '{"surface":"Желудок","canonical_candidate_ru":"Желудок","canonical_candidate_latin":"",'
+                '"entity_type":"organ_or_body_system","article_candidate":false,"tag_role":"context_only",'
+                '"is_primary":false,"confidence":0.95,"evidence_quotes":["Желудок"],'
+                '"quote_validation_status":"all_exact","quote_validation_details":[{"status":"exact"}]}'
+                "]}\n",
+                encoding="utf-8",
+            )
+            records, _, _ = load_tagging_records(path)
+            mentions, _, _ = flatten_mentions(records, source_file=path)
+            normalized = normalize_mention(mentions[0])
+
+        self.assertEqual(normalized.risk_flags, [])
+        self.assertEqual(normalized.suspicious_flags, [])
+        self.assertIn("context_only", normalized.routing_flags)
 
 
 if __name__ == "__main__":

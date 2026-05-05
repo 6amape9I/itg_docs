@@ -50,11 +50,22 @@ class NormalizationN1RunnerTests(unittest.TestCase):
                 "normalization_n1_manifest.json",
                 "type_role_stats.csv",
                 "suspicious_mentions.jsonl",
+                "risk_mentions.jsonl",
+                "routing_mentions.jsonl",
                 "failed_documents_snapshot.jsonl",
                 "quote_issue_mentions.jsonl",
+                "singleton_entity_candidates.csv",
+                "singleton_entity_candidates.jsonl",
+                "cluster_duplicate_diagnostics.csv",
             ):
                 self.assertTrue((data_dir / "normalization" / filename).exists(), filename)
             self.assertEqual(len(read_jsonl(data_dir / "normalization" / "failed_documents_snapshot.jsonl")), 0)
+            self.assertEqual(report["stage_version"], "n1.1")
+            self.assertIn("risk_mentions", report["counts"])
+            self.assertIn("routing_mentions", report["counts"])
+            self.assertIn("cluster_status_counts", report)
+            singleton_rows = read_jsonl(data_dir / "normalization" / "singleton_entity_candidates.jsonl")
+            self.assertTrue(any(row["recommended_fast_path"] for row in singleton_rows))
 
     def test_runner_writes_failed_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -72,6 +83,58 @@ class NormalizationN1RunnerTests(unittest.TestCase):
 
             self.assertEqual(report["counts"]["failed_documents"], 1)
             self.assertEqual(failed_snapshot[0]["suggested_followup"], "name_only_recovery_after_normalization")
+
+    def test_singleton_with_competing_article_candidate_is_not_fast_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            tagging_dir = data_dir / "tagging"
+            tagging_dir.mkdir(parents=True)
+            (tagging_dir / "document_tags_raw_active.jsonl").write_text(
+                json.dumps(
+                    {
+                        "doc_id": "doc_1",
+                        "document_name": "Гастрит и язва",
+                        "entities": [
+                            {
+                                "surface": "Гастрит",
+                                "canonical_candidate_ru": "Гастрит",
+                                "canonical_candidate_latin": "Gastritis",
+                                "entity_type": "disease",
+                                "article_candidate": True,
+                                "tag_role": "article_candidate",
+                                "is_primary": True,
+                                "confidence": 0.95,
+                                "evidence_quotes": ["Гастрит"],
+                                "quote_validation_status": "all_exact",
+                                "quote_validation_details": [{"status": "exact"}],
+                            },
+                            {
+                                "surface": "Язва желудка",
+                                "canonical_candidate_ru": "Язва желудка",
+                                "canonical_candidate_latin": "Gastric ulcer",
+                                "entity_type": "disease",
+                                "article_candidate": True,
+                                "tag_role": "article_candidate",
+                                "is_primary": False,
+                                "confidence": 0.92,
+                                "evidence_quotes": ["язва желудка"],
+                                "quote_validation_status": "all_exact",
+                                "quote_validation_details": [{"status": "exact"}],
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            run_normalization_n1(N1Config.from_data_dir(data_dir))
+            singleton_rows = read_jsonl(data_dir / "normalization" / "singleton_entity_candidates.jsonl")
+
+        self.assertEqual(len(singleton_rows), 2)
+        self.assertTrue(all(not row["recommended_fast_path"] for row in singleton_rows))
+        self.assertTrue(all(row["has_competing_article_candidates"] for row in singleton_rows))
 
 
 def _active_fixture() -> str:

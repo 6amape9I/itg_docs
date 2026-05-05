@@ -6,8 +6,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
-from kb_rebuild.normalization.auto_cluster import build_auto_cluster_key
-from kb_rebuild.normalization.models import AutoCluster, NormalizedMention, TagMention
+from kb_rebuild.normalization.auto_cluster import BLOCKING_FLAGS, build_auto_cluster_key
+from kb_rebuild.normalization.models import AutoCluster, NormalizedMention
 
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
@@ -41,6 +41,8 @@ def build_report(
     clusters: list[AutoCluster],
     failed_documents_count: int,
     invalid_records_count: int,
+    singleton_rows: list[dict[str, Any]],
+    duplicate_diagnostics_rows: list[dict[str, Any]],
     warnings: list[str],
     min_mentions_for_report: int,
 ) -> dict[str, Any]:
@@ -50,9 +52,13 @@ def build_report(
     tag_role_counts = Counter(mention.tag_role for mention in mentions)
     quote_status_counts = Counter(mention.quote_validation_status for mention in mentions)
     article_candidate_counts = Counter(str(mention.article_candidate).lower() for mention in mentions)
+    risk_flag_counts = Counter(flag for mention in mentions for flag in mention.risk_flags)
+    routing_flag_counts = Counter(flag for mention in mentions for flag in mention.routing_flags)
+    cluster_status_counts = Counter(cluster.cluster_status for cluster in clusters)
 
     return {
         "stage": "normalization_n1",
+        "stage_version": "n1.1",
         "created_at": created_at,
         "input": input_paths,
         "counts": {
@@ -66,6 +72,23 @@ def build_report(
             "suspicious_mentions": sum(1 for mention in mentions if mention.suspicious_flags),
             "quote_issue_mentions": sum(1 for mention in mentions if "quote_not_found" in mention.suspicious_flags),
             "invalid_tagging_records": invalid_records_count,
+            "risk_mentions": sum(1 for mention in mentions if mention.risk_flags),
+            "routing_mentions": sum(1 for mention in mentions if mention.routing_flags),
+            "routing_context_only_mentions": sum(1 for mention in mentions if "context_only" in mention.routing_flags),
+            "routing_folder_candidate_mentions": sum(1 for mention in mentions if "folder_candidate" in mention.routing_flags),
+            "singleton_entity_candidates": len(singleton_rows),
+            "singleton_fast_path_recommended": sum(1 for row in singleton_rows if row.get("recommended_fast_path")),
+            "review_groups_total": cluster_status_counts.get("review_group", 0),
+            "auto_merged_clusters_total": cluster_status_counts.get("auto_merged", 0),
+            "isolated_mentions_total": cluster_status_counts.get("isolated_mention", 0),
+            "cluster_duplicate_diagnostics": len(duplicate_diagnostics_rows),
+        },
+        "risk_flag_counts": dict(sorted(risk_flag_counts.items())),
+        "routing_flag_counts": dict(sorted(routing_flag_counts.items())),
+        "cluster_status_counts": {
+            "auto_merged": cluster_status_counts.get("auto_merged", 0),
+            "review_group": cluster_status_counts.get("review_group", 0),
+            "isolated_mention": cluster_status_counts.get("isolated_mention", 0),
         },
         "entity_type_counts": dict(sorted(entity_type_counts.items())),
         "tag_role_counts": dict(sorted(tag_role_counts.items())),
@@ -134,6 +157,11 @@ def build_auto_cluster_csv_rows(clusters: list[AutoCluster]) -> list[dict[str, A
                 "context_only_count": cluster.context_only_count,
                 "avg_confidence": cluster.confidence_stats.get("avg", 0.0),
                 "quote_not_found_count": cluster.quote_not_found_count,
+                "cluster_status": cluster.cluster_status,
+                "merge_allowed": cluster.merge_allowed,
+                "blocking_flags": "; ".join(cluster.blocking_flags),
+                "risk_flags": "; ".join(cluster.risk_flags),
+                "routing_flags": "; ".join(cluster.routing_flags),
                 "review_required": cluster.review_required,
                 "review_reasons": "; ".join(cluster.review_reasons),
             }
@@ -197,11 +225,110 @@ def build_top_canonical_candidates_rows(mentions: list[NormalizedMention]) -> li
     return sorted(rows, key=lambda row: (str(row["entity_type"]), -int(row["mentions_count"]), str(row["canonical_candidate_ru"])))
 
 
+def build_cluster_duplicate_diagnostics_rows(clusters: list[AutoCluster]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[AutoCluster]] = defaultdict(list)
+    for cluster in clusters:
+        grouped[(cluster.entity_type, cluster.auto_cluster_key)].append(cluster)
+    rows: list[dict[str, Any]] = []
+    for (entity_type, duplicate_key), group in grouped.items():
+        if len(group) <= 1:
+            continue
+        rows.append(
+            {
+                "duplicate_key": duplicate_key,
+                "duplicate_type": "entity_type_auto_cluster_key",
+                "rows_count": len(group),
+                "entity_type": entity_type,
+                "canonical_display_candidates": "; ".join(
+                    cluster.canonical_display_candidate for cluster in group if cluster.canonical_display_candidate
+                ),
+                "auto_cluster_ids": "; ".join(cluster.auto_cluster_id for cluster in group),
+                "reason": "duplicate entity_type + auto_cluster_key rows",
+            }
+        )
+    return sorted(rows, key=lambda row: (str(row["entity_type"]), str(row["duplicate_key"])))
+
+
+def build_singleton_entity_candidate_rows(
+    mentions: list[NormalizedMention],
+    clusters: list[AutoCluster],
+) -> list[dict[str, Any]]:
+    mentions_by_id = {mention.mention_id: mention for mention in mentions}
+    doc_article_mentions: dict[str, list[NormalizedMention]] = defaultdict(list)
+    for mention in mentions:
+        if mention.article_candidate and mention.tag_role == "article_candidate":
+            doc_article_mentions[mention.doc_id].append(mention)
+
+    rows: list[dict[str, Any]] = []
+    for cluster in clusters:
+        if cluster.documents_count != 1:
+            continue
+        cluster_mentions = [mentions_by_id[mention_id] for mention_id in cluster.mention_ids if mention_id in mentions_by_id]
+        article_mentions = [
+            mention
+            for mention in cluster_mentions
+            if mention.article_candidate and mention.tag_role == "article_candidate"
+        ]
+        if not article_mentions:
+            continue
+        representative = sorted(article_mentions, key=lambda mention: (-mention.confidence, mention.mention_id))[0]
+        doc_articles = doc_article_mentions.get(representative.doc_id, [])
+        competing_mentions = [mention for mention in doc_articles if mention.mention_id != representative.mention_id]
+        competing_values = _first_unique((mention.raw_value for mention in competing_mentions if mention.raw_value), 20)
+        critical_flags = sorted((set(representative.risk_flags) | set(cluster.blocking_flags)) & _singleton_critical_flags())
+        recommended_fast_path = (
+            representative.confidence >= 0.85
+            and not critical_flags
+            and "quote_not_found" not in representative.risk_flags
+            and "low_confidence" not in representative.risk_flags
+            and len(doc_articles) == 1
+        )
+        review_reasons = list(cluster.review_reasons)
+        if critical_flags:
+            review_reasons.extend(critical_flags)
+        if competing_mentions:
+            review_reasons.append("has_competing_article_candidates")
+        if representative.confidence < 0.85:
+            review_reasons.append("confidence_below_singleton_threshold")
+        review_reasons = sorted(set(review_reasons))
+        rows.append(
+            {
+                "candidate_id": f"sec_{len(rows) + 1:07d}",
+                "doc_id": representative.doc_id,
+                "document_name": representative.document_name,
+                "entity_type": representative.entity_type,
+                "canonical_display_candidate": cluster.canonical_display_candidate,
+                "canonical_latin_candidate": cluster.canonical_latin_candidate,
+                "surface": str(representative.raw.get("surface", "")),
+                "confidence": representative.confidence,
+                "quote_validation_status": representative.quote_validation_status,
+                "mentions_count": cluster.mentions_count,
+                "documents_count": cluster.documents_count,
+                "document_article_candidate_count": len(doc_articles),
+                "has_competing_article_candidates": bool(competing_mentions),
+                "competing_article_candidates": competing_values,
+                "recommended_fast_path": recommended_fast_path,
+                "review_required": not recommended_fast_path,
+                "review_reasons": review_reasons,
+            }
+        )
+    return rows
+
+
 def attach_auto_cluster_keys(mentions: list[NormalizedMention]) -> list[NormalizedMention]:
     # N1 keeps the auto-cluster key in cluster artifacts; this helper is kept for reports that need it later.
     for mention in mentions:
         build_auto_cluster_key(mention)
     return mentions
+
+
+def _singleton_critical_flags() -> set[str]:
+    return set(BLOCKING_FLAGS) | {
+        "quote_not_found",
+        "low_confidence",
+        "has_type_subtype_marker",
+        "possible_parent_child_term",
+    }
 
 
 def _counter_rows(counter: Counter[str], *, min_count: int, limit: int) -> list[dict[str, Any]]:

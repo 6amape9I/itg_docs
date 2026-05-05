@@ -81,6 +81,8 @@ class NormalizedMention:
     quote_validation_status: str
     quote_validation_details: list[Any]
     normalization_flags: list[str]
+    risk_flags: list[str]
+    routing_flags: list[str]
     suspicious_flags: list[str]
     source_file: str
 
@@ -109,6 +111,8 @@ class NormalizedMention:
             "quote_validation_status": self.quote_validation_status,
             "quote_validation_details": self.quote_validation_details,
             "normalization_flags": self.normalization_flags,
+            "risk_flags": self.risk_flags,
+            "routing_flags": self.routing_flags,
             "suspicious_flags": self.suspicious_flags,
             "source_file": self.source_file,
         }
@@ -134,6 +138,11 @@ class AutoCluster:
     confidence_stats: JsonDict
     quote_status_count: dict[str, int]
     normalization_method: str
+    cluster_status: str
+    merge_allowed: bool
+    blocking_flags: list[str]
+    risk_flags: list[str]
+    routing_flags: list[str]
     review_required: bool
     review_reasons: list[str]
 
@@ -157,6 +166,11 @@ class AutoCluster:
             "confidence_stats": self.confidence_stats,
             "quote_status_count": self.quote_status_count,
             "normalization_method": self.normalization_method,
+            "cluster_status": self.cluster_status,
+            "merge_allowed": self.merge_allowed,
+            "blocking_flags": self.blocking_flags,
+            "risk_flags": self.risk_flags,
+            "routing_flags": self.routing_flags,
             "review_required": self.review_required,
             "review_reasons": self.review_reasons,
         }

@@ -78,6 +78,35 @@ class ProductNormalization:
     value: str
     changed: bool
     too_short: bool
+    numeric_variant_changed: bool = False
+
+
+ROUTING_FLAG_NAMES = {
+    "article_candidate",
+    "context_only",
+    "folder_candidate",
+}
+RISK_FLAG_NAMES = {
+    "empty_surface",
+    "empty_canonical_candidate_ru",
+    "very_short_alias",
+    "contains_dosage",
+    "contains_packaging",
+    "contains_specificity_modifier",
+    "has_specificity_modifier",
+    "has_type_subtype_marker",
+    "possible_abbreviation",
+    "possible_numeric_dosage_variant",
+    "possible_trade_name_with_dosage",
+    "possible_parent_child_term",
+    "quote_not_found",
+    "low_confidence",
+    "latin_only",
+    "mixed_cyrillic_latin",
+    "possible_genus_level_entity",
+    "product_norm_too_short",
+    "possible_name_only_entity",
+}
 
 
 def normalize_basic_text(value: str | None) -> str:
@@ -125,7 +154,8 @@ def normalize_supplement_name(value: str | None) -> str:
 
 def normalize_product_name(value: str | None, entity_type: str) -> ProductNormalization:
     basic = normalize_basic_text(value)
-    cleaned = basic
+    variant_stripped, numeric_variant_changed = strip_trailing_numeric_product_variant(basic)
+    cleaned = variant_stripped if numeric_variant_changed else basic
     cleaned = re.sub(r"[(),;:]+", " ", cleaned)
     cleaned = DOSAGE_RE.sub(" ", cleaned)
 
@@ -161,10 +191,6 @@ def normalize_product_name(value: str | None, entity_type: str) -> ProductNormal
         "пакетики",
         "пастилки",
         "суппозитории",
-        "мг",
-        "мкг",
-        "мл",
-        "г",
         "шт",
         "штук",
         "n",
@@ -182,8 +208,31 @@ def normalize_product_name(value: str | None, entity_type: str) -> ProductNormal
     compact = re.sub(r"[\W_]+", "", cleaned, flags=re.UNICODE)
     too_short = bool(cleaned) and len(compact) < 3
     if not cleaned or too_short:
-        return ProductNormalization(value=basic, changed=False, too_short=True)
-    return ProductNormalization(value=cleaned, changed=cleaned != basic, too_short=False)
+        return ProductNormalization(
+            value=basic,
+            changed=False,
+            too_short=True,
+            numeric_variant_changed=numeric_variant_changed,
+        )
+    return ProductNormalization(
+        value=cleaned,
+        changed=cleaned != basic,
+        too_short=False,
+        numeric_variant_changed=numeric_variant_changed,
+    )
+
+
+def strip_trailing_numeric_product_variant(value: str | None) -> tuple[str, bool]:
+    normalized = normalize_basic_text(value)
+    if not normalized or _protected_numeric_product_name(normalized):
+        return normalized, False
+    match = re.match(r"(?iu)^(.+?)\s+(\d+[a-zа-я]?)$", normalized)
+    if not match:
+        return normalized, False
+    stem = match.group(1).strip(" -")
+    if not stem or _protected_numeric_product_name(stem):
+        return normalized, False
+    return stem, True
 
 
 def normalize_drug_class(value: str | None) -> str:
@@ -215,6 +264,28 @@ def has_specificity_modifier(value: str | None) -> bool:
     normalized = normalize_basic_text(value)
     tokens = set(re.findall(r"[\w-]+", normalized, flags=re.UNICODE))
     return bool(tokens & SPECIFICITY_MODIFIERS)
+
+
+def has_type_subtype_marker(value: str | None) -> bool:
+    return subtype_signature(value) != "none"
+
+
+def subtype_signature(value: str | None) -> str:
+    normalized = normalize_basic_text(value)
+    roman = r"(?:i|ii|iii|iv|v|vi|vii|viii|ix|x)"
+    patterns = [
+        rf"\b(?P<value>\d+[a-zа-я]?|{roman})\s*тип(?:а)?\b",
+        rf"\bтип(?:а)?\s*(?P<value>\d+[a-zа-я]?|{roman})\b",
+        r"\btype\s*(?P<value>\d+[a-z]?)\b",
+        r"\b(?P<value>\d+[a-z]?)\s*type\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            return "type_" + match.group("value").lower().replace(" ", "")
+    if re.search(r"(?iu)\bтип(?:а)?\b|\btype\b", normalized):
+        return "type_marker"
+    return "none"
 
 
 def contains_dosage(value: str | None) -> bool:
@@ -254,6 +325,7 @@ def detect_suspicious_flags(
     document_name: str = "",
     product_name_norm: str = "",
     product_too_short: bool = False,
+    product_numeric_variant: bool = False,
 ) -> list[str]:
     flags: list[str] = []
     raw_primary = canonical_candidate_ru.strip() or surface.strip()
@@ -273,6 +345,8 @@ def detect_suspicious_flags(
         flags.append("possible_trade_name_with_dosage")
     if entity_type == "disease" and has_specificity_modifier(raw_primary):
         flags.extend(["contains_specificity_modifier", "has_specificity_modifier", "possible_parent_child_term"])
+    if entity_type == "disease" and has_type_subtype_marker(raw_primary):
+        flags.append("has_type_subtype_marker")
     if quote_has_issue(quote_validation_status, quote_validation_details, evidence_quotes):
         flags.append("quote_not_found")
     if confidence < 0.75:
@@ -289,14 +363,31 @@ def detect_suspicious_flags(
         flags.append("possible_name_only_entity")
     if product_too_short:
         flags.append("product_norm_too_short")
+    if product_numeric_variant:
+        flags.append("possible_numeric_dosage_variant")
     if entity_type == "microorganism" and is_possible_genus_level_entity(raw_primary):
         flags.append("possible_genus_level_entity")
     if entity_type == "diagnostic_method" and diagnostic_abbreviation_candidate(raw_primary):
-        flags.append("abbreviation_candidate")
+        pass
     if product_name_norm and product_name_norm != primary_norm:
         flags.append("product_name_cleanup_applied")
 
     return sorted(set(flags))
+
+
+def routing_flags_for_mention(*, tag_role: str, article_candidate: bool) -> list[str]:
+    flags: list[str] = []
+    if article_candidate or tag_role == "article_candidate":
+        flags.append("article_candidate")
+    if tag_role == "context_only":
+        flags.append("context_only")
+    if tag_role == "folder_candidate":
+        flags.append("folder_candidate")
+    return sorted(set(flags))
+
+
+def risk_flags_from_flags(flags: list[str]) -> list[str]:
+    return sorted(flag for flag in set(flags) if flag in RISK_FLAG_NAMES)
 
 
 def normalization_flags_for_values(*values: str) -> list[str]:
@@ -359,6 +450,21 @@ def quote_issue_type(
     if any("..." in str(quote) or "…" in str(quote) for quote in evidence_quotes):
         return "truncated_quote"
     return "quote_issue"
+
+
+def _protected_numeric_product_name(normalized: str) -> bool:
+    if re.search(r"(?iu)\b(?:коэнзим|coq)\s*q?10\b", normalized):
+        return True
+    if re.search(r"(?iu)\bвитамин\s+[a-zа-я]?\d+\b", normalized):
+        return True
+    protected_patterns = [
+        r"(?iu)\bil-\d+\b",
+        r"(?iu)\bfgfr\d+\b",
+        r"(?iu)\bcovid-\d+\b",
+        r"(?iu)\bq10\b",
+        r"(?iu)\bb12\b",
+    ]
+    return any(re.search(pattern, normalized) for pattern in protected_patterns)
 
 
 def _strip_outer_quotes(value: str) -> str:

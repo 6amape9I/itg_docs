@@ -46,6 +46,31 @@ class NormalizationAutoClusterTests(unittest.TestCase):
 
         self.assertEqual(len(clusters), 1)
         self.assertEqual(build_auto_cluster_key(mentions[0]), "drug_trade_name::вольтарен эмульгель")
+        self.assertEqual(clusters[0].canonical_display_candidate, "Вольтарен эмульгель")
+
+    def test_product_canonical_display_prefers_clean_alias(self) -> None:
+        mentions = [
+            normalize_mention(_mention("m_0000001_00", "doc_1", "Берлиприл 20 мг", "Берлиприл 20 мг", "drug_trade_name")),
+            normalize_mention(_mention("m_0000002_00", "doc_2", "Берлиприл 5 мг", "Берлиприл 5 мг", "drug_trade_name")),
+            normalize_mention(_mention("m_0000003_00", "doc_3", "Берлиприл", "Берлиприл", "drug_trade_name")),
+        ]
+        clusters = build_auto_clusters(mentions)
+
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0].canonical_display_candidate, "Берлиприл")
+
+    def test_trailing_numeric_product_variants_group_for_review(self) -> None:
+        mentions = [
+            normalize_mention(_mention("m_0000001_00", "doc_1", "Берлиприл 10", "Берлиприл 10", "drug_trade_name")),
+            normalize_mention(_mention("m_0000002_00", "doc_2", "Берлиприл 20", "Берлиприл 20", "drug_trade_name")),
+        ]
+        clusters = build_auto_clusters(mentions)
+
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0].auto_cluster_key, "drug_trade_name::берлиприл")
+        self.assertEqual(clusters[0].cluster_status, "review_group")
+        self.assertFalse(clusters[0].merge_allowed)
+        self.assertIn("possible_numeric_dosage_variant", clusters[0].blocking_flags)
 
     def test_specific_disease_terms_keep_distinct_keys(self) -> None:
         mentions = [
@@ -64,8 +89,41 @@ class NormalizationAutoClusterTests(unittest.TestCase):
         ]
         clusters = build_auto_clusters(mentions)
 
-        self.assertEqual(len(clusters), 2)
-        self.assertTrue(all(cluster.review_required for cluster in clusters))
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0].cluster_status, "review_group")
+        self.assertFalse(clusters[0].merge_allowed)
+        self.assertIn("very_short_alias", clusters[0].blocking_flags)
+        self.assertIn("possible_abbreviation", clusters[0].blocking_flags)
+
+    def test_short_alias_review_group_does_not_duplicate_rows(self) -> None:
+        mentions = [
+            normalize_mention(_mention("m_0000001_00", "doc_1", "ARX", "ARX", "biological_substance")),
+            normalize_mention(_mention("m_0000002_00", "doc_2", "ARX", "ARX", "biological_substance")),
+            normalize_mention(_mention("m_0000003_00", "doc_3", "ARX", "ARX", "biological_substance")),
+        ]
+        clusters = build_auto_clusters(mentions)
+
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual(clusters[0].auto_cluster_key, "biological_substance::arx")
+        self.assertEqual(clusters[0].mentions_count, 3)
+        self.assertEqual(clusters[0].cluster_status, "review_group")
+        self.assertIn("very_short_alias", clusters[0].blocking_flags)
+
+    def test_disease_subtype_keys_are_distinct_and_reviewed(self) -> None:
+        mentions = [
+            normalize_mention(_mention("m_0000001_00", "doc_1", "GM1 ганглиозидоз", "GM1 ганглиозидоз", "disease")),
+            normalize_mention(_mention("m_0000002_00", "doc_2", "GM1 ганглиозидоз тип 1", "GM1 ганглиозидоз тип 1", "disease")),
+            normalize_mention(_mention("m_0000003_00", "doc_3", "GM1 ганглиозидоз тип 2", "GM1 ганглиозидоз тип 2", "disease")),
+        ]
+        keys = [build_auto_cluster_key(mention) for mention in mentions]
+        clusters = build_auto_clusters(mentions)
+
+        self.assertEqual(len(set(keys)), 3)
+        self.assertIn("disease::gm1 ганглиозидоз тип 1::type_1", keys)
+        self.assertIn("disease::gm1 ганглиозидоз тип 2::type_2", keys)
+        reviewed = [cluster for cluster in clusters if "has_type_subtype_marker" in cluster.risk_flags]
+        self.assertEqual(len(reviewed), 2)
+        self.assertTrue(all(cluster.review_required for cluster in reviewed))
 
     def test_microorganism_genus_and_species_do_not_merge(self) -> None:
         mentions = [

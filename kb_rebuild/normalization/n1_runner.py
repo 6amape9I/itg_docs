@@ -13,7 +13,9 @@ from kb_rebuild.normalization.mentions import flatten_mentions, load_tagging_rec
 from kb_rebuild.normalization.models import AutoCluster, NormalizedMention
 from kb_rebuild.normalization.report import (
     build_auto_cluster_csv_rows,
+    build_cluster_duplicate_diagnostics_rows,
     build_report,
+    build_singleton_entity_candidate_rows,
     build_tags_raw_rows,
     build_top_aliases_by_type_rows,
     build_top_canonical_candidates_rows,
@@ -74,6 +76,11 @@ OUTPUT_FILENAMES = {
     "article_candidate_mentions": "article_candidate_mentions.jsonl",
     "context_only_mentions": "context_only_mentions.jsonl",
     "invalid_tagging_records": "invalid_tagging_records.jsonl",
+    "risk_mentions": "risk_mentions.jsonl",
+    "routing_mentions": "routing_mentions.jsonl",
+    "singleton_entity_candidates_csv": "singleton_entity_candidates.csv",
+    "singleton_entity_candidates_jsonl": "singleton_entity_candidates.jsonl",
+    "cluster_duplicate_diagnostics": "cluster_duplicate_diagnostics.csv",
 }
 
 
@@ -111,6 +118,8 @@ class NormalizationN1Runner:
         self._validate_mentions(normalized_mentions)
         clusters = build_auto_clusters(normalized_mentions)
         self._validate_clusters(clusters, normalized_mentions)
+        singleton_rows = build_singleton_entity_candidate_rows(normalized_mentions, clusters)
+        duplicate_diagnostics_rows = build_cluster_duplicate_diagnostics_rows(clusters)
 
         failed_records, failed_invalids, failed_warnings = self._read_optional_jsonl(
             self.config.failures_path,
@@ -136,6 +145,14 @@ class NormalizationN1Runner:
             self.paths["suspicious_mentions"],
             (mention.to_dict() for mention in normalized_mentions if mention.suspicious_flags),
         )
+        write_jsonl(
+            self.paths["risk_mentions"],
+            (mention.to_dict() for mention in normalized_mentions if mention.risk_flags),
+        )
+        write_jsonl(
+            self.paths["routing_mentions"],
+            (mention.to_dict() for mention in normalized_mentions if mention.routing_flags),
+        )
         write_jsonl(self.paths["failed_documents_snapshot"], failed_snapshot)
         write_jsonl(self.paths["quote_issue_mentions"], quote_issue_mentions)
         write_jsonl(
@@ -147,6 +164,7 @@ class NormalizationN1Runner:
             (mention.to_dict() for mention in normalized_mentions if mention.tag_role == "context_only"),
         )
         write_jsonl(self.paths["invalid_tagging_records"], invalid_records)
+        write_jsonl(self.paths["singleton_entity_candidates_jsonl"], singleton_rows)
 
         write_csv(
             self.paths["tags_raw_csv"],
@@ -180,6 +198,11 @@ class NormalizationN1Runner:
                 "context_only_count",
                 "avg_confidence",
                 "quote_not_found_count",
+                "cluster_status",
+                "merge_allowed",
+                "blocking_flags",
+                "risk_flags",
+                "routing_flags",
                 "review_required",
                 "review_reasons",
             ],
@@ -207,6 +230,42 @@ class NormalizationN1Runner:
             ["entity_type", "canonical_candidate_ru", "normalized_value", "mentions_count", "documents_count"],
             build_top_canonical_candidates_rows(normalized_mentions),
         )
+        write_csv(
+            self.paths["singleton_entity_candidates_csv"],
+            [
+                "candidate_id",
+                "doc_id",
+                "document_name",
+                "entity_type",
+                "canonical_display_candidate",
+                "canonical_latin_candidate",
+                "surface",
+                "confidence",
+                "quote_validation_status",
+                "mentions_count",
+                "documents_count",
+                "document_article_candidate_count",
+                "has_competing_article_candidates",
+                "competing_article_candidates",
+                "recommended_fast_path",
+                "review_required",
+                "review_reasons",
+            ],
+            singleton_rows,
+        )
+        write_csv(
+            self.paths["cluster_duplicate_diagnostics"],
+            [
+                "duplicate_key",
+                "duplicate_type",
+                "rows_count",
+                "entity_type",
+                "canonical_display_candidates",
+                "auto_cluster_ids",
+                "reason",
+            ],
+            duplicate_diagnostics_rows,
+        )
 
         input_sha_after = _sha256_file(self.config.tagging_active_path)
         if input_sha_after != input_sha_before:
@@ -223,6 +282,8 @@ class NormalizationN1Runner:
             clusters=clusters,
             failed_documents_count=len(failed_records),
             invalid_records_count=len(invalid_records),
+            singleton_rows=singleton_rows,
+            duplicate_diagnostics_rows=duplicate_diagnostics_rows,
             warnings=warnings,
             min_mentions_for_report=self.config.min_mentions_for_report,
         )
@@ -328,6 +389,7 @@ class NormalizationN1Runner:
         outputs = {name: str(path) for name, path in self.paths.items()}
         return {
             "stage": "normalization_n1",
+            "stage_version": "n1.1",
             "created_at": created_at,
             "source_tagging_run_id": source_manifest.get("run_id", ""),
             "source_provider": source_manifest.get("provider", ""),

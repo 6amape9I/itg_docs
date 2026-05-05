@@ -14,6 +14,9 @@ from kb_rebuild.normalization.text import (
     normalize_microorganism_text,
     normalize_product_name,
     normalization_flags_for_values,
+    risk_flags_from_flags,
+    routing_flags_for_mention,
+    subtype_signature,
 )
 
 
@@ -139,11 +142,15 @@ def normalize_mention(mention: TagMention) -> NormalizedMention:
     }
     if product_result is not None:
         normalized["product_name_norm"] = product_result.value
+        if product_result.numeric_variant_changed:
+            normalized["product_variant_group_key"] = product_result.value
     abbreviation_candidate = ""
     if mention.entity_type == "diagnostic_method":
         abbreviation_candidate = diagnostic_abbreviation_candidate(primary_raw)
         if abbreviation_candidate:
             normalized["abbreviation_candidate"] = abbreviation_candidate
+    if mention.entity_type == "disease":
+        normalized["subtype_signature"] = subtype_signature(primary_raw)
 
     flags = normalization_flags_for_values(
         mention.surface,
@@ -152,6 +159,8 @@ def normalize_mention(mention: TagMention) -> NormalizedMention:
     )
     if product_result is not None and product_result.changed:
         flags.append("product_name_cleanup")
+    if product_result is not None and product_result.numeric_variant_changed:
+        flags.append("trailing_numeric_product_variant")
     if mention.entity_type == "drug_class" and primary_norm != normalize_basic_text(primary_raw):
         flags.append("drug_class_cleanup")
     if abbreviation_candidate:
@@ -170,6 +179,12 @@ def normalize_mention(mention: TagMention) -> NormalizedMention:
         document_name=mention.document_name,
         product_name_norm=str(normalized.get("product_name_norm", "")),
         product_too_short=bool(product_result and product_result.too_short),
+        product_numeric_variant=bool(product_result and product_result.numeric_variant_changed),
+    )
+    risk_flags = risk_flags_from_flags(suspicious_flags)
+    routing_flags = routing_flags_for_mention(
+        tag_role=mention.tag_role,
+        article_candidate=mention.article_candidate,
     )
 
     return NormalizedMention(
@@ -191,7 +206,9 @@ def normalize_mention(mention: TagMention) -> NormalizedMention:
         quote_validation_status=mention.quote_validation_status,
         quote_validation_details=mention.quote_validation_details,
         normalization_flags=sorted(set(flags)),
-        suspicious_flags=suspicious_flags,
+        risk_flags=risk_flags,
+        routing_flags=routing_flags,
+        suspicious_flags=risk_flags,
         source_file=mention.source_file,
     )
 
