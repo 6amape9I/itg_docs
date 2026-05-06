@@ -22,6 +22,7 @@ from kb_rebuild.llm.tagging_batch import BatchTaggingConfig, run_batch_tagging_c
 from kb_rebuild.llm.tagging import TaggingConfig, run_tagging_calibration
 from kb_rebuild.normalization.n1_runner import N1Config, run_normalization_n1
 from kb_rebuild.normalization.n2.runner import N2Config, run_normalization_n2
+from kb_rebuild.normalization.n3.runner import N3Config, run_normalization_n3
 from kb_rebuild.parsing.documents import parse_csv_documents
 from kb_rebuild.parsing.validate import validate_parsed_artifacts
 from kb_rebuild.reports.run_report import RunReport, write_run_report
@@ -163,6 +164,31 @@ def build_parser() -> argparse.ArgumentParser:
     normalize_n2_parser.add_argument("--high-priority-score", type=_score_float, default=0.88)
     normalize_n2_parser.add_argument("--max-pairs-per-type", type=_positive_int, default=50000)
     normalize_n2_parser.set_defaults(func=run_normalize_n2)
+
+    normalize_n3_parser = subparsers.add_parser("normalize-n3", help="Run N3 LLM validation for N2 candidate groups")
+    normalize_n3_parser.add_argument("--data", default="data", help="Data directory")
+    normalize_n3_parser.add_argument("--normalization-dir", default=None, help="Normalization output directory")
+    normalize_n3_parser.add_argument("--n2-dir", default=None, help="N2 candidate-generation output directory")
+    normalize_n3_parser.add_argument("--out", default=None, help="N3 output directory")
+    normalize_n3_parser.add_argument("--provider", choices=("gemini_direct",), default="gemini_direct")
+    normalize_n3_parser.add_argument("--model", default="gemini-3-flash-preview")
+    normalize_n3_parser.add_argument("--batch-size", type=_positive_int, default=1)
+    normalize_n3_parser.add_argument("--max-inflight", type=_positive_int, default=8)
+    normalize_n3_parser.add_argument("--max-retries", type=_non_negative_int, default=3)
+    normalize_n3_parser.add_argument("--max-cost-usd", type=_non_negative_float, default=20.0)
+    normalize_n3_parser.add_argument(
+        "--structured-output-mode",
+        choices=("gemini_schema", "gemini_schema_lite", "prompt_json"),
+        default="gemini_schema",
+    )
+    normalize_n3_parser.add_argument("--enable-web-review", action="store_true")
+    normalize_n3_parser.add_argument("--web-review-model", default="gemini-2.5-flash")
+    normalize_n3_parser.add_argument("--web-review-limit", type=_positive_int, default=50)
+    normalize_n3_parser.add_argument("--max-output-tokens", type=_positive_int, default=6000)
+    normalize_n3_parser.add_argument("--repair-max-output-tokens", type=_positive_int, default=12000)
+    normalize_n3_parser.add_argument("--thinking-level", choices=("minimal", "low", "medium", "high", "none"), default="minimal")
+    normalize_n3_parser.add_argument("--no-overwrite", action="store_true")
+    normalize_n3_parser.set_defaults(func=run_normalize_n3)
 
     return parser
 
@@ -589,6 +615,77 @@ def run_normalize_n2(args: argparse.Namespace) -> int:
         print(f"WARNING: {warning}")
     if len(warnings) > 10:
         print(f"WARNING: {len(warnings) - 10} more warnings in candidate_generation_report.json")
+    return 0
+
+
+def run_normalize_n3(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data)
+    logger = configure_logging(data_dir)
+    load_dotenv_gemini_keys(Path(".env"))
+    config = N3Config.from_data_dir(
+        data_dir,
+        normalization_dir=Path(args.normalization_dir) if args.normalization_dir else None,
+        n2_dir=Path(args.n2_dir) if args.n2_dir else None,
+        out_dir=Path(args.out) if args.out else None,
+        provider=args.provider,
+        model=args.model,
+        batch_size=args.batch_size,
+        max_inflight=args.max_inflight,
+        max_retries=args.max_retries,
+        max_cost_usd=args.max_cost_usd,
+        structured_output_mode=args.structured_output_mode,
+        enable_web_review=args.enable_web_review,
+        web_review_model=args.web_review_model,
+        web_review_limit=args.web_review_limit,
+        no_overwrite=args.no_overwrite,
+        max_output_tokens=args.max_output_tokens,
+        repair_max_output_tokens=args.repair_max_output_tokens,
+        thinking_level=None if args.thinking_level == "none" else args.thinking_level,
+    )
+    logger.info(
+        "normalization N3 started data_dir=%s normalization_dir=%s n2_dir=%s out=%s provider=%s model=%s batch_size=%s max_inflight=%s max_cost_usd=%s web_review=%s",
+        config.data_dir,
+        config.normalization_dir,
+        config.n2_dir,
+        config.out_dir,
+        config.provider,
+        config.model,
+        config.batch_size,
+        config.max_inflight,
+        config.max_cost_usd,
+        config.enable_web_review,
+    )
+    try:
+        client = GeminiClient()
+        logger.info("Gemini direct key rotation enabled key_count=%s", client.api_keys_count)
+        report = run_normalization_n3(config, client=client)
+    except Exception as exc:
+        logger.exception("normalization N3 failed")
+        print(f"Normalization N3 failed: {exc}")
+        return 1
+
+    counts = report.get("counts", {})
+    cost = report.get("cost", {})
+    quality = report.get("quality", {})
+    logger.info("normalization N3 finished counts=%s cost=%s quality=%s", counts, cost, quality)
+    print(
+        "Normalization N3 complete: "
+        f"groups={counts.get('groups_processed', 0)} "
+        f"accept={counts.get('accepted_same_entity', 0)} "
+        f"reject={counts.get('rejected_distinct_entities', 0)} "
+        f"split={counts.get('split_into_subclusters', 0)} "
+        f"review={counts.get('review_groups_total', 0)} "
+        f"accepted_clusters={counts.get('accepted_clusters_total', 0)} "
+        f"invalid={counts.get('invalid_llm_responses', 0)} "
+        f"cost=${cost.get('estimated_cost_usd', 0.0)} "
+        f"quality_passed={quality.get('passed')} "
+        f"out={config.out_dir}"
+    )
+    warnings = report.get("warnings", [])
+    for warning in warnings[:10]:
+        print(f"WARNING: {warning}")
+    if len(warnings) > 10:
+        print(f"WARNING: {len(warnings) - 10} more warnings in n3_report.json")
     return 0
 
 
