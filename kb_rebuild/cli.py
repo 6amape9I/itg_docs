@@ -6,6 +6,8 @@ import logging
 from pathlib import Path
 from typing import Any, Sequence
 
+from kb_rebuild.articles.a1.models import A1Config
+from kb_rebuild.articles.a1.runner import run_article_a1_bootstrap
 from kb_rebuild.articles.planning.models import A0Config
 from kb_rebuild.articles.planning.runner import run_article_planning_a0
 from kb_rebuild.io.jsonl import write_jsonl
@@ -216,6 +218,19 @@ def build_parser() -> argparse.ArgumentParser:
     article_plan_a0_parser.add_argument("--review-sample-size", type=_non_negative_int, default=500)
     article_plan_a0_parser.add_argument("--no-overwrite", action="store_true")
     article_plan_a0_parser.set_defaults(func=run_article_plan_a0)
+
+    article_a1_parser = subparsers.add_parser("article-a1-bootstrap", help="Build A1 entity JSON/status layer and A2 task queue")
+    article_a1_parser.add_argument("--data", default="data", help="Data directory")
+    article_a1_parser.add_argument("--articles-planning-dir", default=None, help="A0 article planning output directory")
+    article_a1_parser.add_argument("--normalization-final-dir", default=None, help="N4 final normalization directory")
+    article_a1_parser.add_argument("--parsed-dir", default=None, help="Parsed document artifacts directory")
+    article_a1_parser.add_argument("--out", default=None, help="A1 output directory")
+    article_a1_parser.add_argument("--entities-out", default=None, help="Entity JSON output directory")
+    article_a1_parser.add_argument("--review-sample-size", type=_non_negative_int, default=500)
+    article_a1_parser.add_argument("--low-count-doc-threshold", type=_positive_int, default=3)
+    article_a1_parser.add_argument("--high-frequency-doc-threshold", type=_positive_int, default=20)
+    article_a1_parser.add_argument("--no-overwrite", action="store_true")
+    article_a1_parser.set_defaults(func=run_article_a1)
 
     return parser
 
@@ -810,6 +825,58 @@ def run_article_plan_a0(args: argparse.Namespace) -> int:
         print(f"WARNING: {warning}")
     if len(warnings) > 10:
         print(f"WARNING: {len(warnings) - 10} more warnings in article_planning_report.json")
+    return 0
+
+
+def run_article_a1(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data)
+    logger = configure_logging(data_dir)
+    config = A1Config.from_data_dir(
+        data_dir,
+        articles_planning_dir=Path(args.articles_planning_dir) if args.articles_planning_dir else None,
+        normalization_final_dir=Path(args.normalization_final_dir) if args.normalization_final_dir else None,
+        parsed_dir=Path(args.parsed_dir) if args.parsed_dir else None,
+        out_dir=Path(args.out) if args.out else None,
+        entities_out_dir=Path(args.entities_out) if args.entities_out else None,
+        review_sample_size=args.review_sample_size,
+        low_count_doc_threshold=args.low_count_doc_threshold,
+        high_frequency_doc_threshold=args.high_frequency_doc_threshold,
+        overwrite=not args.no_overwrite,
+    )
+    logger.info(
+        "article A1 started data_dir=%s articles_planning_dir=%s normalization_final_dir=%s parsed_dir=%s out=%s entities_out=%s",
+        config.data_dir,
+        config.articles_planning_dir,
+        config.normalization_final_dir,
+        config.parsed_dir,
+        config.out_dir,
+        config.entities_out_dir,
+    )
+    try:
+        report = run_article_a1_bootstrap(config)
+    except Exception as exc:
+        logger.exception("article A1 failed")
+        print(f"Article A1 failed: {exc}")
+        return 1
+
+    counts = report.get("counts", {})
+    logger.info("article A1 finished counts=%s quality=%s", counts, report.get("quality", {}))
+    print(
+        "Article A1 complete: "
+        f"final_tags={counts.get('final_tags_total', 0)} "
+        f"entity_json={counts.get('entity_json_files_created', 0)} "
+        f"rerouted={counts.get('a0_1_rerouted_from_review_stub', 0)} "
+        f"direct_copy={counts.get('direct_copy_articles', 0)} "
+        f"direct_rejected={counts.get('direct_copy_rejected', 0)} "
+        f"review_stub={counts.get('review_stub_articles', 0)} "
+        f"a2_tasks={counts.get('a2_extraction_tasks_total', 0)} "
+        f"out={config.out_dir}"
+    )
+    warnings = report.get("warnings", [])
+    for warning in warnings[:10]:
+        print(f"WARNING: {warning}")
+    if len(warnings) > 10:
+        print(f"WARNING: {len(warnings) - 10} more warnings in a1_report.json")
     return 0
 
 
