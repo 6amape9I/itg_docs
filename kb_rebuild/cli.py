@@ -6,6 +6,8 @@ import logging
 from pathlib import Path
 from typing import Any, Sequence
 
+from kb_rebuild.articles.planning.models import A0Config
+from kb_rebuild.articles.planning.runner import run_article_planning_a0
 from kb_rebuild.io.jsonl import write_jsonl
 from kb_rebuild.llm.gemini_client import GeminiClient, GeminiError, load_dotenv_gemini_keys
 from kb_rebuild.llm.models import (
@@ -199,6 +201,21 @@ def build_parser() -> argparse.ArgumentParser:
     normalize_n4_parser.add_argument("--out", default=None, help="N4 final output directory")
     normalize_n4_parser.add_argument("--review-sample-size", type=_non_negative_int, default=500)
     normalize_n4_parser.set_defaults(func=run_normalize_n4)
+
+    article_plan_a0_parser = subparsers.add_parser("article-plan-a0", help="Build deterministic article source windows and work plan")
+    article_plan_a0_parser.add_argument("--data", default="data", help="Data directory")
+    article_plan_a0_parser.add_argument("--normalization-final-dir", default=None, help="N4 final normalization directory")
+    article_plan_a0_parser.add_argument("--parsed-dir", default=None, help="Parsed document artifacts directory")
+    article_plan_a0_parser.add_argument("--normalization-dir", default=None, help="Normalization directory with mention context")
+    article_plan_a0_parser.add_argument("--out", default=None, help="Article planning output directory")
+    article_plan_a0_parser.add_argument("--max-neighbor-blocks", type=_non_negative_int, default=2)
+    article_plan_a0_parser.add_argument("--max-window-chars", type=_positive_int, default=12000)
+    article_plan_a0_parser.add_argument("--short-document-char-limit", type=_positive_int, default=12000)
+    article_plan_a0_parser.add_argument("--high-frequency-doc-threshold", type=_positive_int, default=20)
+    article_plan_a0_parser.add_argument("--low-count-doc-threshold", type=_positive_int, default=3)
+    article_plan_a0_parser.add_argument("--review-sample-size", type=_non_negative_int, default=500)
+    article_plan_a0_parser.add_argument("--no-overwrite", action="store_true")
+    article_plan_a0_parser.set_defaults(func=run_article_plan_a0)
 
     return parser
 
@@ -740,6 +757,59 @@ def run_normalize_n4(args: argparse.Namespace) -> int:
         f"quality_passed={quality.get('passed')} "
         f"out={config.out_dir}"
     )
+    return 0
+
+
+def run_article_plan_a0(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data)
+    logger = configure_logging(data_dir)
+    config = A0Config.from_data_dir(
+        data_dir,
+        normalization_final_dir=Path(args.normalization_final_dir) if args.normalization_final_dir else None,
+        parsed_dir=Path(args.parsed_dir) if args.parsed_dir else None,
+        normalization_dir=Path(args.normalization_dir) if args.normalization_dir else None,
+        out_dir=Path(args.out) if args.out else None,
+        max_neighbor_blocks=args.max_neighbor_blocks,
+        max_window_chars=args.max_window_chars,
+        short_document_char_limit=args.short_document_char_limit,
+        high_frequency_doc_threshold=args.high_frequency_doc_threshold,
+        low_count_doc_threshold=args.low_count_doc_threshold,
+        review_sample_size=args.review_sample_size,
+        overwrite=not args.no_overwrite,
+    )
+    logger.info(
+        "article planning A0 started data_dir=%s normalization_final_dir=%s parsed_dir=%s normalization_dir=%s out=%s",
+        config.data_dir,
+        config.normalization_final_dir,
+        config.parsed_dir,
+        config.normalization_dir,
+        config.out_dir,
+    )
+    try:
+        report = run_article_planning_a0(config)
+    except Exception as exc:
+        logger.exception("article planning A0 failed")
+        print(f"Article planning A0 failed: {exc}")
+        return 1
+
+    counts = report.get("counts", {})
+    logger.info("article planning A0 finished counts=%s", counts)
+    print(
+        "Article planning A0 complete: "
+        f"final_tags={counts.get('final_tags_total', 0)} "
+        f"source_windows={counts.get('source_windows_total', 0)} "
+        f"direct_copy={counts.get('direct_copy_candidates', 0)} "
+        f"singleton={counts.get('singleton_candidates', 0)} "
+        f"stub_only={counts.get('stub_only_tags', 0)} "
+        f"review_stub={counts.get('review_stub_tags', 0)} "
+        f"no_source={counts.get('no_source_window_tags', 0)} "
+        f"out={config.out_dir}"
+    )
+    warnings = report.get("warnings", [])
+    for warning in warnings[:10]:
+        print(f"WARNING: {warning}")
+    if len(warnings) > 10:
+        print(f"WARNING: {len(warnings) - 10} more warnings in article_planning_report.json")
     return 0
 
 
