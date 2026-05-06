@@ -8,6 +8,8 @@ from typing import Any, Sequence
 
 from kb_rebuild.articles.a1.models import A1Config
 from kb_rebuild.articles.a1.runner import run_article_a1_bootstrap
+from kb_rebuild.articles.a2.models import A2Config
+from kb_rebuild.articles.a2.runner import run_article_a2_extraction
 from kb_rebuild.articles.planning.models import A0Config
 from kb_rebuild.articles.planning.runner import run_article_planning_a0
 from kb_rebuild.io.jsonl import write_jsonl
@@ -231,6 +233,39 @@ def build_parser() -> argparse.ArgumentParser:
     article_a1_parser.add_argument("--high-frequency-doc-threshold", type=_positive_int, default=20)
     article_a1_parser.add_argument("--no-overwrite", action="store_true")
     article_a1_parser.set_defaults(func=run_article_a1)
+
+    article_a2_parser = subparsers.add_parser("article-a2-extract", help="Extract A2 evidence items from A1 source windows")
+    article_a2_parser.add_argument("--data", default="data", help="Data directory")
+    article_a2_parser.add_argument("--a1-dir", default=None, help="A1 output directory")
+    article_a2_parser.add_argument("--planning-dir", default=None, help="A0 article planning output directory")
+    article_a2_parser.add_argument("--normalization-final-dir", default=None, help="N4 final normalization directory")
+    article_a2_parser.add_argument("--out", default=None, help="A2 output directory")
+    article_a2_parser.add_argument("--provider", choices=("gemini_direct",), default="gemini_direct")
+    article_a2_parser.add_argument("--model", default="gemini-3-flash-preview")
+    article_a2_parser.add_argument(
+        "--structured-output-mode",
+        choices=("gemini_schema", "gemini_schema_lite", "prompt_json"),
+        default="gemini_schema",
+    )
+    article_a2_parser.add_argument("--limit", type=_positive_int, default=None)
+    article_a2_parser.add_argument("--task-filter", choices=("all", "pending_review"), default="all")
+    article_a2_parser.add_argument(
+        "--strategy-filter",
+        default="single_doc_extract,low_count_batch_extract,multi_doc_map_reduce,high_frequency_map_reduce",
+    )
+    article_a2_parser.add_argument("--priority-filter", default="high,medium,low")
+    article_a2_parser.add_argument("--max-tasks-per-batch", type=_positive_int, default=8)
+    article_a2_parser.add_argument("--batch-char-limit", type=_positive_int, default=60000)
+    article_a2_parser.add_argument("--max-inflight", type=_positive_int, default=8)
+    article_a2_parser.add_argument("--max-retries", type=_non_negative_int, default=3)
+    article_a2_parser.add_argument("--max-output-tokens", type=_positive_int, default=12000)
+    article_a2_parser.add_argument("--repair-max-output-tokens", type=_positive_int, default=24000)
+    article_a2_parser.add_argument("--thinking-level", choices=("minimal", "low", "medium", "high", "none"), default="minimal")
+    article_a2_parser.add_argument("--max-cost-usd", type=_non_negative_float, default=20.0)
+    article_a2_parser.add_argument("--retry-failures", action="store_true")
+    article_a2_parser.add_argument("--no-resume", action="store_true")
+    article_a2_parser.add_argument("--experiment-name", default=None)
+    article_a2_parser.set_defaults(func=run_article_a2)
 
     return parser
 
@@ -880,6 +915,82 @@ def run_article_a1(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_article_a2(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data)
+    logger = configure_logging(data_dir)
+    load_dotenv_gemini_keys(Path(".env"))
+    config = A2Config.from_data_dir(
+        data_dir,
+        a1_dir=Path(args.a1_dir) if args.a1_dir else None,
+        planning_dir=Path(args.planning_dir) if args.planning_dir else None,
+        normalization_final_dir=Path(args.normalization_final_dir) if args.normalization_final_dir else None,
+        out_dir=Path(args.out) if args.out else None,
+        provider=args.provider,
+        model=args.model,
+        structured_output_mode=args.structured_output_mode,
+        limit=args.limit,
+        task_filter=args.task_filter,
+        strategy_filter=_split_csv_arg(args.strategy_filter),
+        priority_filter=_split_csv_arg(args.priority_filter),
+        max_tasks_per_batch=args.max_tasks_per_batch,
+        batch_char_limit=args.batch_char_limit,
+        max_inflight=args.max_inflight,
+        max_retries=args.max_retries,
+        max_output_tokens=args.max_output_tokens,
+        repair_max_output_tokens=args.repair_max_output_tokens,
+        thinking_level=None if args.thinking_level == "none" else args.thinking_level,
+        max_cost_usd=args.max_cost_usd,
+        retry_failures=args.retry_failures,
+        resume=not args.no_resume,
+        experiment_name=args.experiment_name,
+    )
+    logger.info(
+        "article A2 started data_dir=%s a1_dir=%s planning_dir=%s out=%s provider=%s model=%s limit=%s max_inflight=%s experiment=%s",
+        config.data_dir,
+        config.a1_dir,
+        config.planning_dir,
+        config.out_dir,
+        config.provider,
+        config.model,
+        config.limit,
+        config.max_inflight,
+        config.experiment_name,
+    )
+    try:
+        client = GeminiClient()
+        logger.info("Gemini direct key rotation enabled key_count=%s", client.api_keys_count)
+        report = run_article_a2_extraction(config, client=client)
+    except Exception as exc:
+        logger.exception("article A2 failed")
+        print(f"Article A2 failed: {exc}")
+        return 1
+
+    counts = report.get("counts", {})
+    llm = report.get("llm", {})
+    quality = report.get("quality", {})
+    logger.info("article A2 finished counts=%s llm=%s quality=%s", counts, llm, quality)
+    print(
+        "Article A2 complete: "
+        f"tasks={counts.get('tasks_processed', 0)} "
+        f"evidence_items={counts.get('evidence_items_total', 0)} "
+        f"no_evidence={counts.get('tasks_no_evidence', 0)} "
+        f"review={counts.get('tasks_review', 0)} "
+        f"failed={counts.get('tasks_failed', 0)} "
+        f"quote_not_found={counts.get('evidence_items_quote_not_found', 0)} "
+        f"cost=${llm.get('estimated_cost_usd', 0.0)} "
+        f"quality_passed={quality.get('passed')} "
+        f"out={config.out_dir}"
+    )
+    if report.get("stop_reason"):
+        print(f"Stopped: {report['stop_reason']}")
+    warnings = report.get("warnings", [])
+    for warning in warnings[:10]:
+        print(f"WARNING: {warning}")
+    if len(warnings) > 10:
+        print(f"WARNING: {len(warnings) - 10} more warnings in a2_report.json")
+    return 0
+
+
 def configure_logging(out_dir: Path) -> logging.Logger:
     logs_dir = out_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -938,6 +1049,12 @@ def _parse_optional_model(value: str | None) -> str | None:
     if not stripped or stripped.lower() in {"none", "null", "off"}:
         return None
     return stripped
+
+
+def _split_csv_arg(value: str | None) -> tuple[str, ...]:
+    if value is None:
+        return tuple()
+    return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
 def _gemini_models_markdown(raw: dict[str, Any], client: GeminiClient) -> str:
