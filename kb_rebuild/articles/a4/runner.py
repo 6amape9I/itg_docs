@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import csv
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -100,6 +101,20 @@ class ArticleA4Runner:
 
         a4_inputs = read_jsonl(self.inputs["a4_compilation_input_jsonl"])
         fact_groups = read_jsonl(self.inputs["fact_groups_jsonl"])
+        previous_report = self._existing_report() if self.config.resume else None
+        if previous_report:
+            self._seed_stats_from_previous_report(previous_report)
+        previous_tasks = _dedupe_by_tag_id(self._existing_jsonl("article_compilation_tasks_jsonl")) if self.config.resume else []
+        previous_batches = self._existing_jsonl("article_compilation_batches_jsonl") if self.config.resume else []
+        previous_article_drafts = _dedupe_by_tag_id(self._existing_jsonl("article_drafts_jsonl")) if self.config.resume else []
+        previous_failed_tasks = (
+            _dedupe_by_tag_id(self._existing_jsonl("article_compilation_failures_jsonl"))
+            if self.config.resume and not self.config.retry_failures
+            else []
+        )
+        previous_invalid_llm_responses = self._existing_jsonl("invalid_llm_responses_jsonl") if self.config.resume else []
+        previous_quality_issues = self._existing_jsonl("article_quality_issues_jsonl") if self.config.resume else []
+        previous_batch_reports = self._existing_batch_reports() if self.config.resume else []
         completed_tag_ids = self._completed_tag_ids() if self.config.resume else set()
         tasks = build_compilation_tasks(
             a4_inputs=a4_inputs,
@@ -112,12 +127,14 @@ class ArticleA4Runner:
             max_quotes_per_tag=self.config.max_quotes_per_tag,
             completed_task_tag_ids=completed_tag_ids,
             retry_failures=self.config.retry_failures,
+            task_id_offset=len(previous_tasks) or len(previous_article_drafts),
         )
         batches = build_batches(
             tasks,
             max_tags_per_batch=self.config.max_tags_per_batch,
             batch_char_limit=self.config.batch_char_limit,
         )
+        _renumber_batches(batches, offset=len(previous_batches))
 
         status_updates = status_updates_for_all_inputs(a4_inputs, tasks)
         article_drafts: list[dict[str, Any]] = []
@@ -135,34 +152,44 @@ class ArticleA4Runner:
             quality_issues.extend(outcome["article_quality_issues"])
             batch_reports.extend(outcome["batch_reports"])
 
+        all_tasks = previous_tasks + tasks
+        all_batches = previous_batches + batches
+        all_article_drafts = previous_article_drafts + article_drafts
+        all_failed_tasks = previous_failed_tasks + failed_tasks
+        all_invalid_llm_responses = previous_invalid_llm_responses + invalid_llm_responses
+        all_quality_issues = previous_quality_issues + quality_issues
+        all_batch_reports = previous_batch_reports + batch_reports
+        all_review_rows = [_review_row_from_draft(draft) for draft in all_article_drafts if draft.get("needs_review_before_publication") or draft.get("article_status") != "compiled_article"]
+        all_review_rows.extend(all_failed_tasks)
+
         self._write_compiled_article_files(article_drafts)
-        status_updates.extend(_result_status_updates(article_drafts, failed_tasks))
+        status_updates.extend(_result_status_updates(all_article_drafts, all_failed_tasks))
         report = build_report(
             created_at=created_at,
             config=self.config,
             inputs=self.inputs,
-            tasks=tasks,
-            batches=batches,
-            article_drafts=article_drafts,
-            failed_tasks=failed_tasks,
-            batch_reports=batch_reports,
-            invalid_llm_responses=invalid_llm_responses,
-            article_quality_issues=quality_issues,
+            tasks=all_tasks,
+            batches=all_batches,
+            article_drafts=all_article_drafts,
+            failed_tasks=all_failed_tasks,
+            batch_reports=all_batch_reports,
+            invalid_llm_responses=all_invalid_llm_responses,
+            article_quality_issues=all_quality_issues,
             stats=self.stats,
             stop_reason=self._stop_reason,
             warnings=warnings,
         )
         manifest = build_manifest(created_at=created_at, config=self.config, inputs=self.inputs, outputs=self.outputs)
         self._write_outputs(
-            tasks=tasks,
-            batches=batches,
-            article_drafts=article_drafts,
+            tasks=all_tasks,
+            batches=all_batches,
+            article_drafts=all_article_drafts,
             status_updates=status_updates,
-            failed_tasks=failed_tasks,
-            review_rows=review_rows,
-            invalid_llm_responses=invalid_llm_responses,
-            article_quality_issues=quality_issues,
-            batch_reports=batch_reports,
+            failed_tasks=all_failed_tasks,
+            review_rows=all_review_rows,
+            invalid_llm_responses=all_invalid_llm_responses,
+            article_quality_issues=all_quality_issues,
+            batch_reports=all_batch_reports,
             report=report,
             manifest=manifest,
         )
@@ -600,12 +627,13 @@ class ArticleA4Runner:
         validate_direct_gemini_model_id(self.config.model)
         if self.config.structured_output_mode not in {"gemini_schema", "gemini_schema_lite", "prompt_json"}:
             raise ValueError("structured_output_mode must be gemini_schema, gemini_schema_lite or prompt_json")
-        if self.config.limit is None:
-            raise ValueError("A4 production/no-limit run is forbidden in this implementation turn; pass an explicit smoke --limit")
+        production_output = _is_production_output_path(self.config.out_dir)
+        if self.config.limit is None and not self.config.allow_production:
+            raise ValueError("A4 production/no-limit run requires --allow-production")
         if self.config.limit == 4000:
             raise ValueError("A4 test run with --limit 4000 is forbidden")
-        if any(str(part).startswith("production") for part in self.config.out_dir.parts):
-            raise ValueError("A4 production output paths are forbidden without separate architect approval")
+        if production_output and not self.config.allow_production:
+            raise ValueError("A4 production output paths require --allow-production")
         if self.config.max_tags_per_batch < 1:
             raise ValueError("max_tags_per_batch must be >= 1")
         if self.config.max_fact_groups_per_tag < 1:
@@ -666,6 +694,32 @@ class ArticleA4Runner:
             if str(row.get("article_status") or "") in {"compiled_article", "compiled_with_review_flag"}:
                 completed.add(str(row.get("tag_id") or ""))
         return completed
+
+    def _existing_jsonl(self, output_name: str) -> list[dict[str, Any]]:
+        path = self.outputs[output_name]
+        return read_jsonl(path) if path.exists() else []
+
+    def _existing_report(self) -> dict[str, Any] | None:
+        path = self.outputs["a4_report_json"]
+        return _read_json(path) if path.exists() else None
+
+    def _existing_batch_reports(self) -> list[dict[str, Any]]:
+        path = self.outputs["batch_report_csv"]
+        if not path.exists():
+            return []
+        with path.open("r", encoding="utf-8", newline="") as fh:
+            return [dict(row) for row in csv.DictReader(fh)]
+
+    def _seed_stats_from_previous_report(self, report: dict[str, Any]) -> None:
+        llm = report.get("llm", {}) if isinstance(report.get("llm"), dict) else {}
+        self.stats["requests"] = int(llm.get("requests", 0) or 0)
+        self.stats["cache_hits"] = int(llm.get("cache_hits", 0) or 0)
+        self.stats["cache_misses"] = int(llm.get("cache_misses", 0) or 0)
+        self.stats["invalid_json_count"] = int(llm.get("invalid_json_count", 0) or 0)
+        self.stats["schema_validation_failures"] = int(llm.get("schema_validation_failures", 0) or 0)
+        self.stats["http_status_counts"] = dict(llm.get("http_status_counts", {}) or {})
+        self.stats["estimated_cost_usd"] = round(float(llm.get("estimated_cost_usd", 0.0) or 0.0), 8)
+        self.stats["batch_splits"] = int(report.get("counts", {}).get("batch_splits", 0) or 0)
 
     def _client(self) -> Any:
         if self.client is None:
@@ -862,6 +916,13 @@ def _split_batch(batch: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]
     return _child_batch(batch, left_tasks, "s1"), _child_batch(batch, right_tasks, "s2")
 
 
+def _renumber_batches(batches: list[dict[str, Any]], *, offset: int) -> None:
+    if offset <= 0:
+        return
+    for index, batch in enumerate(batches, start=offset + 1):
+        batch["batch_id"] = f"a4batch_{index:06d}"
+
+
 def _child_batch(parent: dict[str, Any], tasks: list[dict[str, Any]], suffix: str) -> dict[str, Any]:
     return {
         "batch_id": f"{parent.get('batch_id')}_{suffix}",
@@ -890,12 +951,28 @@ def _merge_outcomes(outcomes: list[dict[str, Any]]) -> dict[str, Any]:
     return merged
 
 
+def _dedupe_by_tag_id(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_tag_id: dict[str, dict[str, Any]] = {}
+    without_tag_id: list[dict[str, Any]] = []
+    for row in rows:
+        tag_id = str(row.get("tag_id") or "")
+        if not tag_id:
+            without_tag_id.append(row)
+            continue
+        by_tag_id[tag_id] = row
+    return [*without_tag_id, *by_tag_id.values()]
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as fh:
         value = json.load(fh)
     if not isinstance(value, dict):
         raise ValueError(f"JSON object expected: {path}")
     return value
+
+
+def _is_production_output_path(path: Path) -> bool:
+    return any(str(part).startswith("production") for part in path.parts)
 
 
 def _safe_usage(value: Any) -> dict[str, int]:

@@ -315,6 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
     article_a4_parser.add_argument("--retry-failures", action="store_true")
     article_a4_parser.add_argument("--no-resume", action="store_true")
     article_a4_parser.add_argument("--experiment-name", default=None)
+    article_a4_parser.add_argument("--allow-production", action="store_true")
     article_a4_parser.set_defaults(func=run_article_a4)
 
     return parser
@@ -1126,6 +1127,7 @@ def run_article_a4(args: argparse.Namespace) -> int:
         retry_failures=args.retry_failures,
         resume=not args.no_resume,
         experiment_name=args.experiment_name,
+        allow_production=args.allow_production,
     )
     logger.info(
         "article A4 started data_dir=%s a3_dir=%s a1_dir=%s entities_dir=%s out=%s provider=%s model=%s limit=%s max_inflight=%s experiment=%s",

@@ -99,6 +99,7 @@ class A4Config:
     retry_failures: bool = False
     resume: bool = True
     experiment_name: str | None = None
+    allow_production: bool = False
     temperature: float = 0.0
 
     @classmethod
@@ -131,6 +132,7 @@ class A4Config:
         retry_failures: bool = False,
         resume: bool = True,
         experiment_name: str | None = None,
+        allow_production: bool = False,
     ) -> "A4Config":
         return cls(
             data_dir=data_dir,
@@ -159,5 +161,5 @@ class A4Config:
             retry_failures=retry_failures,
             resume=resume,
             experiment_name=experiment_name,
+            allow_production=allow_production,
         )
-

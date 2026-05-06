@@ -64,6 +64,7 @@ def build_compilation_tasks(
     max_quotes_per_tag: int,
     completed_task_tag_ids: set[str] | None = None,
     retry_failures: bool = False,
+    task_id_offset: int = 0,
 ) -> list[dict[str, Any]]:
     fact_groups_by_id = {str(row.get("fact_group_id") or ""): row for row in fact_groups}
     completed = completed_task_tag_ids or set()
@@ -78,7 +79,7 @@ def build_compilation_tasks(
         if entity_type_filter is not None and entity_type not in entity_type_filter:
             continue
         tag_id = str(row.get("tag_id") or "")
-        if completed and tag_id in completed and not retry_failures:
+        if completed and tag_id in completed:
             continue
         selected_groups, excluded_ids = select_fact_groups(
             row,
@@ -117,7 +118,7 @@ def build_compilation_tasks(
         candidates.append(task)
 
     selected = _select_smoke_tasks(candidates, limit=limit)
-    for index, task in enumerate(selected, start=1):
+    for index, task in enumerate(selected, start=task_id_offset + 1):
         task["task_id"] = f"a4task_{index:09d}"
     return selected
 
@@ -327,4 +328,3 @@ def _list_value(value: Any) -> list[str]:
     if value:
         return [str(value)]
     return []
-

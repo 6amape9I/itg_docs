@@ -235,6 +235,7 @@ def build_manifest(
             "retry_failures": config.retry_failures,
             "resume": config.resume,
             "experiment_name": config.experiment_name,
+            "allow_production": config.allow_production,
         },
     }
 

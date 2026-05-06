@@ -112,7 +112,41 @@ class ArticleA4RunnerTests(unittest.TestCase):
             report = run_article_a4_compilation(config, client=second_client)
 
             self.assertEqual(len(second_client.payloads), 0)
-            self.assertEqual(report["counts"]["tasks_requested"], 0)
+            self.assertEqual(report["counts"]["tasks_requested"], 1)
+            self.assertEqual(report["counts"]["tasks_processed"], 1)
+
+    def test_resume_keeps_cumulative_outputs_and_unique_task_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_inputs(root, tags_count=2)
+            first_config = _config(root, limit=1, max_inflight=1, resume=True)
+            run_article_a4_compilation(first_config, client=FakeGeminiClient())
+
+            second_config = _config(root, limit=2, max_inflight=1, resume=True)
+            report = run_article_a4_compilation(second_config, client=FakeGeminiClient())
+
+            drafts = read_jsonl(second_config.out_dir / "article_drafts.jsonl")
+            task_ids = [row["task_id"] for row in drafts]
+            self.assertEqual(report["counts"]["tasks_processed"], 2)
+            self.assertEqual(len(drafts), 2)
+            self.assertEqual(len(set(task_ids)), 2)
+            self.assertEqual(task_ids, ["a4task_000000001", "a4task_000000002"])
+
+    def test_retry_failures_resume_still_skips_successes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_inputs(root, tags_count=2)
+            first_config = _config(root, limit=1, max_inflight=1, resume=True)
+            run_article_a4_compilation(first_config, client=FakeGeminiClient())
+
+            second_client = FakeGeminiClient()
+            second_config = _config(root, limit=2, max_inflight=1, resume=True, retry_failures=True)
+            report = run_article_a4_compilation(second_config, client=second_client)
+
+            drafts = read_jsonl(second_config.out_dir / "article_drafts.jsonl")
+            self.assertEqual(len(second_client.payloads), 1)
+            self.assertEqual(report["counts"]["tasks_processed"], 2)
+            self.assertEqual(len(drafts), 2)
 
     def test_smoke_limit_respected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -126,24 +160,61 @@ class ArticleA4RunnerTests(unittest.TestCase):
             tasks = read_jsonl(config.out_dir / "article_compilation_tasks.jsonl")
             self.assertEqual(len(tasks), 1)
 
-    def test_production_without_limit_is_refused(self) -> None:
+    def test_production_no_limit_without_flag_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _write_inputs(root)
-            config = _config(root, limit=None, max_inflight=1)
+            config = _config(root, limit=None, max_inflight=1, out_dir=root / "articles" / "a4" / "production_v1")
 
             with self.assertRaises(ValueError):
                 run_article_a4_compilation(config, client=FakeGeminiClient())
 
+    def test_production_no_limit_with_flag_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_inputs(root)
+            config = _config(
+                root,
+                limit=None,
+                max_inflight=1,
+                out_dir=root / "articles" / "a4" / "production_v1",
+                allow_production=True,
+            )
+
+            report = run_article_a4_compilation(config, client=FakeGeminiClient())
+
+            self.assertEqual(report["counts"]["tasks_processed"], 1)
+            manifest = json.loads((config.out_dir / "a4_manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(manifest["config"]["allow_production"])
+
+    def test_smoke_limits_50_and_200_work_without_production_flag(self) -> None:
+        for limit in (50, 200):
+            with self.subTest(limit=limit):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    _write_inputs(root, tags_count=3)
+                    config = _config(
+                        root,
+                        limit=limit,
+                        max_inflight=1,
+                        out_dir=root / "articles" / "a4" / "experiments" / f"smoke_{limit}",
+                    )
+
+                    report = run_article_a4_compilation(config, client=FakeGeminiClient())
+
+                    self.assertEqual(report["counts"]["tasks_requested"], 3)
+                    self.assertTrue(report["quality"]["passed"])
+
 
 def _config(root: Path, **kwargs: Any) -> A4Config:
+    out_dir = kwargs.pop("out_dir", root / "articles" / "a4" / "experiments" / "smoke_test")
     return A4Config.from_data_dir(
         root,
         a3_dir=root / "articles" / "a3",
         a1_dir=root / "articles" / "a1",
         entities_dir=root / "articles" / "entities",
         normalization_final_dir=root / "normalization" / "final",
-        out_dir=root / "articles" / "a4" / "experiments" / "smoke_test",
+        out_dir=out_dir,
         structured_output_mode="prompt_json",
         max_output_tokens=1200,
         repair_max_output_tokens=2400,
