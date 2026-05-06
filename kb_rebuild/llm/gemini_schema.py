@@ -62,5 +62,8 @@ def _clean_schema(value: Any, *, lite: bool) -> Any:
     for key, item in value.items():
         if key in dropped:
             continue
+        if key == "properties" and isinstance(item, dict):
+            result[key] = {prop_name: _clean_schema(prop_schema, lite=lite) for prop_name, prop_schema in item.items()}
+            continue
         result[key] = _clean_schema(item, lite=lite)
     return result

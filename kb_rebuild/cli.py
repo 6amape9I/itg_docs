@@ -12,6 +12,8 @@ from kb_rebuild.articles.a2.models import A2Config
 from kb_rebuild.articles.a2.runner import run_article_a2_extraction
 from kb_rebuild.articles.a3.models import A3Config
 from kb_rebuild.articles.a3.runner import run_article_a3_grouping
+from kb_rebuild.articles.a4.models import A4Config
+from kb_rebuild.articles.a4.runner import run_article_a4_compilation
 from kb_rebuild.articles.planning.models import A0Config
 from kb_rebuild.articles.planning.runner import run_article_planning_a0
 from kb_rebuild.io.jsonl import write_jsonl
@@ -281,6 +283,39 @@ def build_parser() -> argparse.ArgumentParser:
     article_a3_parser.add_argument("--max-fact-groups-per-tag", type=_positive_int, default=200)
     article_a3_parser.add_argument("--no-overwrite", action="store_true")
     article_a3_parser.set_defaults(func=run_article_a3)
+
+    article_a4_parser = subparsers.add_parser("article-a4-compile", help="Compile A4 article drafts from A3 fact groups")
+    article_a4_parser.add_argument("--data", default="data", help="Data directory")
+    article_a4_parser.add_argument("--a3-dir", default=None, help="A3 output directory")
+    article_a4_parser.add_argument("--a1-dir", default=None, help="A1 output directory")
+    article_a4_parser.add_argument("--entities-dir", default=None, help="A1 entity JSON directory")
+    article_a4_parser.add_argument("--normalization-final-dir", default=None, help="N4 final normalization directory")
+    article_a4_parser.add_argument("--out", default=None, help="A4 output directory")
+    article_a4_parser.add_argument("--provider", choices=("gemini_direct",), default="gemini_direct")
+    article_a4_parser.add_argument("--model", default="gemini-3-flash-preview")
+    article_a4_parser.add_argument(
+        "--structured-output-mode",
+        choices=("gemini_schema", "gemini_schema_lite", "prompt_json"),
+        default="gemini_schema",
+    )
+    article_a4_parser.add_argument("--limit", type=_positive_int, default=None)
+    article_a4_parser.add_argument("--strategy-filter", default="compile_from_fact_groups,compile_with_review_flag")
+    article_a4_parser.add_argument("--entity-type-filter", default=None)
+    article_a4_parser.add_argument("--priority-filter", default="high,medium,low")
+    article_a4_parser.add_argument("--max-tags-per-batch", type=_positive_int, default=2)
+    article_a4_parser.add_argument("--max-fact-groups-per-tag", type=_positive_int, default=80)
+    article_a4_parser.add_argument("--max-quotes-per-tag", type=_positive_int, default=120)
+    article_a4_parser.add_argument("--batch-char-limit", type=_positive_int, default=70000)
+    article_a4_parser.add_argument("--max-inflight", type=_positive_int, default=8)
+    article_a4_parser.add_argument("--max-retries", type=_non_negative_int, default=3)
+    article_a4_parser.add_argument("--max-output-tokens", type=_positive_int, default=16000)
+    article_a4_parser.add_argument("--repair-max-output-tokens", type=_positive_int, default=32000)
+    article_a4_parser.add_argument("--thinking-level", choices=("minimal", "low", "medium", "high", "none"), default="minimal")
+    article_a4_parser.add_argument("--max-cost-usd", type=_non_negative_float, default=20.0)
+    article_a4_parser.add_argument("--retry-failures", action="store_true")
+    article_a4_parser.add_argument("--no-resume", action="store_true")
+    article_a4_parser.add_argument("--experiment-name", default=None)
+    article_a4_parser.set_defaults(func=run_article_a4)
 
     return parser
 
@@ -1057,6 +1092,85 @@ def run_article_a3(args: argparse.Namespace) -> int:
         print(f"WARNING: {warning}")
     if len(warnings) > 10:
         print(f"WARNING: {len(warnings) - 10} more warnings in a3_report.json")
+    return 0
+
+
+def run_article_a4(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data)
+    logger = configure_logging(data_dir)
+    load_dotenv_gemini_keys(Path(".env"))
+    config = A4Config.from_data_dir(
+        data_dir,
+        a3_dir=Path(args.a3_dir) if args.a3_dir else None,
+        a1_dir=Path(args.a1_dir) if args.a1_dir else None,
+        entities_dir=Path(args.entities_dir) if args.entities_dir else None,
+        normalization_final_dir=Path(args.normalization_final_dir) if args.normalization_final_dir else None,
+        out_dir=Path(args.out) if args.out else None,
+        provider=args.provider,
+        model=args.model,
+        structured_output_mode=args.structured_output_mode,
+        limit=args.limit,
+        strategy_filter=_split_csv_arg(args.strategy_filter),
+        entity_type_filter=_split_csv_arg(args.entity_type_filter) if args.entity_type_filter else None,
+        priority_filter=_split_csv_arg(args.priority_filter),
+        max_tags_per_batch=args.max_tags_per_batch,
+        max_fact_groups_per_tag=args.max_fact_groups_per_tag,
+        max_quotes_per_tag=args.max_quotes_per_tag,
+        batch_char_limit=args.batch_char_limit,
+        max_inflight=args.max_inflight,
+        max_retries=args.max_retries,
+        max_output_tokens=args.max_output_tokens,
+        repair_max_output_tokens=args.repair_max_output_tokens,
+        thinking_level=None if args.thinking_level == "none" else args.thinking_level,
+        max_cost_usd=args.max_cost_usd,
+        retry_failures=args.retry_failures,
+        resume=not args.no_resume,
+        experiment_name=args.experiment_name,
+    )
+    logger.info(
+        "article A4 started data_dir=%s a3_dir=%s a1_dir=%s entities_dir=%s out=%s provider=%s model=%s limit=%s max_inflight=%s experiment=%s",
+        config.data_dir,
+        config.a3_dir,
+        config.a1_dir,
+        config.entities_dir,
+        config.out_dir,
+        config.provider,
+        config.model,
+        config.limit,
+        config.max_inflight,
+        config.experiment_name,
+    )
+    try:
+        client = GeminiClient()
+        logger.info("Gemini direct key rotation enabled key_count=%s", client.api_keys_count)
+        report = run_article_a4_compilation(config, client=client)
+    except Exception as exc:
+        logger.exception("article A4 failed")
+        print(f"Article A4 failed: {exc}")
+        return 1
+
+    counts = report.get("counts", {})
+    llm = report.get("llm", {})
+    quality = report.get("quality", {})
+    logger.info("article A4 finished counts=%s llm=%s quality=%s", counts, llm, quality)
+    print(
+        "Article A4 complete: "
+        f"tasks={counts.get('tasks_processed', 0)} "
+        f"drafts={counts.get('article_drafts_total', 0)} "
+        f"compiled={counts.get('compiled_article', 0)} "
+        f"review={counts.get('compiled_with_review_flag', 0)} "
+        f"failed={counts.get('tasks_failed', 0)} "
+        f"cost=${llm.get('estimated_cost_usd', 0.0)} "
+        f"quality_passed={quality.get('passed')} "
+        f"out={config.out_dir}"
+    )
+    if report.get("stop_reason"):
+        print(f"Stopped: {report['stop_reason']}")
+    warnings = report.get("warnings", [])
+    for warning in warnings[:10]:
+        print(f"WARNING: {warning}")
+    if len(warnings) > 10:
+        print(f"WARNING: {len(warnings) - 10} more warnings in a4_report.json")
     return 0
 
 
