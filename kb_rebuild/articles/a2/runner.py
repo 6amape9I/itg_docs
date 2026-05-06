@@ -61,6 +61,8 @@ OUTPUT_FILENAMES = {
     "smoke_200_report_json": "smoke_200_report.json",
 }
 
+PROGRESS_WRITE_TASK_INTERVAL = 500
+
 
 def run_article_a2_extraction(config: A2Config, client: Any | None = None) -> dict[str, Any]:
     return ArticleA2Runner(config=config, client=client).run()
@@ -123,7 +125,6 @@ class ArticleA2Runner:
             batch_char_limit=self.config.batch_char_limit,
         )
 
-        batch_outcomes = self._process_batches(batches)
         task_results: list[dict[str, Any]] = []
         evidence_items: list[dict[str, Any]] = []
         no_evidence_tasks: list[dict[str, Any]] = []
@@ -132,25 +133,44 @@ class ArticleA2Runner:
         quote_validation_issues: list[dict[str, Any]] = []
         invalid_llm_responses: list[dict[str, Any]] = []
         batch_reports: list[dict[str, Any]] = []
+        processed_batches: list[dict[str, Any]] = []
+        next_progress_write_at = PROGRESS_WRITE_TASK_INTERVAL
+        next_evidence_item_index = 1
 
-        for outcome in batch_outcomes:
-            task_results.extend(outcome["task_results"])
+        for batch, outcome in self._process_batches(batches):
+            processed_batches.append(batch)
+            for item in outcome["evidence_items"]:
+                item["evidence_item_id"] = f"ev_{next_evidence_item_index:09d}"
+                next_evidence_item_index += 1
+            new_task_results = outcome["task_results"]
+            task_results.extend(new_task_results)
             evidence_items.extend(outcome["evidence_items"])
             quote_validation_issues.extend(outcome["quote_validation_issues"])
             invalid_llm_responses.extend(outcome["invalid_llm_responses"])
             batch_reports.extend(outcome["batch_reports"])
-
-        for index, item in enumerate(evidence_items, start=1):
-            item["evidence_item_id"] = f"ev_{index:09d}"
-
-        for result in task_results:
-            status = str(result.get("status") or "")
-            if status == "no_evidence":
-                no_evidence_tasks.append(result)
-            elif status == "review":
-                review_tasks.append(result)
-            elif status == "failed":
-                failed_tasks.append(result)
+            for result in new_task_results:
+                status = str(result.get("status") or "")
+                if status == "no_evidence":
+                    no_evidence_tasks.append(result)
+                elif status == "review":
+                    review_tasks.append(result)
+                elif status == "failed":
+                    failed_tasks.append(result)
+            if len(task_results) >= next_progress_write_at:
+                self._write_progress_outputs(
+                    created_at=created_at,
+                    warnings=warnings,
+                    batches=processed_batches,
+                    task_results=task_results,
+                    evidence_items=evidence_items,
+                    no_evidence_tasks=no_evidence_tasks,
+                    review_tasks=review_tasks,
+                    failed_tasks=failed_tasks,
+                    invalid_llm_responses=invalid_llm_responses,
+                    quote_validation_issues=quote_validation_issues,
+                    batch_reports=batch_reports,
+                )
+                next_progress_write_at = ((len(task_results) // PROGRESS_WRITE_TASK_INTERVAL) + 1) * PROGRESS_WRITE_TASK_INTERVAL
 
         report = build_report(
             created_at=created_at,
@@ -182,20 +202,22 @@ class ArticleA2Runner:
         )
         return report
 
-    def _process_batches(self, batches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _process_batches(self, batches: list[dict[str, Any]]):
         if not batches:
-            return []
+            return
         if self.config.max_inflight == 1 or len(batches) == 1:
-            return [self._process_batch(batch, split_depth=0) for batch in batches]
+            for batch in batches:
+                yield batch, self._process_batch(batch, split_depth=0)
+            return
 
-        results: list[dict[str, Any] | None] = [None] * len(batches)
         executor = ThreadPoolExecutor(max_workers=self.config.max_inflight)
         futures: dict[Future[dict[str, Any]], int] = {
             executor.submit(self._process_batch, batch, 0): index for index, batch in enumerate(batches)
         }
         try:
             for future in as_completed(futures):
-                results[futures[future]] = future.result()
+                index = futures[future]
+                yield batches[index], future.result()
         except Exception:
             for future in futures:
                 future.cancel()
@@ -203,7 +225,6 @@ class ArticleA2Runner:
             raise
         else:
             executor.shutdown(wait=True)
-        return [item for item in results if item is not None]
 
     def _process_batch(self, batch: dict[str, Any], split_depth: int) -> dict[str, Any]:
         last_errors: list[str] = []
@@ -655,6 +676,50 @@ class ArticleA2Runner:
             write_json(self.outputs["smoke_50_report_json"], report)
         if self.config.experiment_name == "smoke_200":
             write_json(self.outputs["smoke_200_report_json"], report)
+
+    def _write_progress_outputs(
+        self,
+        *,
+        created_at: str,
+        warnings: list[str],
+        batches: list[dict[str, Any]],
+        task_results: list[dict[str, Any]],
+        evidence_items: list[dict[str, Any]],
+        no_evidence_tasks: list[dict[str, Any]],
+        review_tasks: list[dict[str, Any]],
+        failed_tasks: list[dict[str, Any]],
+        invalid_llm_responses: list[dict[str, Any]],
+        quote_validation_issues: list[dict[str, Any]],
+        batch_reports: list[dict[str, Any]],
+    ) -> None:
+        report = build_report(
+            created_at=created_at,
+            config=self.config,
+            inputs=self.inputs,
+            task_results=task_results,
+            evidence_items=evidence_items,
+            batches=batches,
+            batch_reports=batch_reports,
+            invalid_llm_responses=invalid_llm_responses,
+            quote_validation_issues=quote_validation_issues,
+            stats=self.stats,
+            stop_reason=self._stop_reason,
+            warnings=warnings + ["partial_progress_report"],
+        )
+        manifest = build_manifest(created_at=created_at, config=self.config, inputs=self.inputs, outputs=self.outputs)
+        self._write_outputs(
+            batches=batches,
+            task_results=task_results,
+            evidence_items=evidence_items,
+            no_evidence_tasks=no_evidence_tasks,
+            review_tasks=review_tasks,
+            failed_tasks=failed_tasks,
+            invalid_llm_responses=invalid_llm_responses,
+            quote_validation_issues=quote_validation_issues,
+            batch_reports=batch_reports,
+            report=report,
+            manifest=manifest,
+        )
 
     def _validate_config(self) -> None:
         if self.config.provider != "gemini_direct":
