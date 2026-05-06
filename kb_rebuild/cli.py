@@ -23,6 +23,7 @@ from kb_rebuild.llm.tagging import TaggingConfig, run_tagging_calibration
 from kb_rebuild.normalization.n1_runner import N1Config, run_normalization_n1
 from kb_rebuild.normalization.n2.runner import N2Config, run_normalization_n2
 from kb_rebuild.normalization.n3.runner import N3Config, run_normalization_n3
+from kb_rebuild.normalization.n4.runner import N4Config, run_normalization_n4
 from kb_rebuild.parsing.documents import parse_csv_documents
 from kb_rebuild.parsing.validate import validate_parsed_artifacts
 from kb_rebuild.reports.run_report import RunReport, write_run_report
@@ -189,6 +190,15 @@ def build_parser() -> argparse.ArgumentParser:
     normalize_n3_parser.add_argument("--thinking-level", choices=("minimal", "low", "medium", "high", "none"), default="minimal")
     normalize_n3_parser.add_argument("--no-overwrite", action="store_true")
     normalize_n3_parser.set_defaults(func=run_normalize_n3)
+
+    normalize_n4_parser = subparsers.add_parser("normalize-n4", help="Run N4 final canonical normalization layer")
+    normalize_n4_parser.add_argument("--data", default="data", help="Data directory")
+    normalize_n4_parser.add_argument("--normalization-dir", default=None, help="Normalization output directory")
+    normalize_n4_parser.add_argument("--n2-dir", default=None, help="N2 candidate-generation output directory")
+    normalize_n4_parser.add_argument("--n3-dir", default=None, help="N3 LLM-validation output directory")
+    normalize_n4_parser.add_argument("--out", default=None, help="N4 final output directory")
+    normalize_n4_parser.add_argument("--review-sample-size", type=_non_negative_int, default=500)
+    normalize_n4_parser.set_defaults(func=run_normalize_n4)
 
     return parser
 
@@ -686,6 +696,50 @@ def run_normalize_n3(args: argparse.Namespace) -> int:
         print(f"WARNING: {warning}")
     if len(warnings) > 10:
         print(f"WARNING: {len(warnings) - 10} more warnings in n3_report.json")
+    return 0
+
+
+def run_normalize_n4(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data)
+    logger = configure_logging(data_dir)
+    config = N4Config.from_data_dir(
+        data_dir,
+        normalization_dir=Path(args.normalization_dir) if args.normalization_dir else None,
+        n2_dir=Path(args.n2_dir) if args.n2_dir else None,
+        n3_dir=Path(args.n3_dir) if args.n3_dir else None,
+        out_dir=Path(args.out) if args.out else None,
+        review_sample_size=args.review_sample_size,
+    )
+    logger.info(
+        "normalization N4 started data_dir=%s normalization_dir=%s n2_dir=%s n3_dir=%s out=%s review_sample_size=%s",
+        config.data_dir,
+        config.normalization_dir,
+        config.n2_dir,
+        config.n3_dir,
+        config.out_dir,
+        config.review_sample_size,
+    )
+    try:
+        report = run_normalization_n4(config)
+    except Exception as exc:
+        logger.exception("normalization N4 failed")
+        print(f"Normalization N4 failed: {exc}")
+        return 1
+
+    counts = report.get("counts", {})
+    quality = report.get("quality", {})
+    logger.info("normalization N4 finished counts=%s quality=%s", counts, quality)
+    print(
+        "Normalization N4 complete: "
+        f"mentions={counts.get('mentions_total', 0)} "
+        f"links={counts.get('document_tag_links_total', 0)} "
+        f"final_tags={counts.get('final_canonical_tags_total', 0)} "
+        f"standalone={counts.get('standalone_auto_cluster_tags', 0)} "
+        f"merged={counts.get('merged_n3_tags', 0)} "
+        f"aliases={counts.get('aliases_total', 0)} "
+        f"quality_passed={quality.get('passed')} "
+        f"out={config.out_dir}"
+    )
     return 0
 
 
