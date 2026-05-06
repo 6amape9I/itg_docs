@@ -10,6 +10,8 @@ from kb_rebuild.articles.a1.models import A1Config
 from kb_rebuild.articles.a1.runner import run_article_a1_bootstrap
 from kb_rebuild.articles.a2.models import A2Config
 from kb_rebuild.articles.a2.runner import run_article_a2_extraction
+from kb_rebuild.articles.a3.models import A3Config
+from kb_rebuild.articles.a3.runner import run_article_a3_grouping
 from kb_rebuild.articles.planning.models import A0Config
 from kb_rebuild.articles.planning.runner import run_article_planning_a0
 from kb_rebuild.io.jsonl import write_jsonl
@@ -266,6 +268,19 @@ def build_parser() -> argparse.ArgumentParser:
     article_a2_parser.add_argument("--no-resume", action="store_true")
     article_a2_parser.add_argument("--experiment-name", default=None)
     article_a2_parser.set_defaults(func=run_article_a2)
+
+    article_a3_parser = subparsers.add_parser("article-a3-group-evidence", help="Group A2 evidence items into A3 fact groups")
+    article_a3_parser.add_argument("--data", default="data", help="Data directory")
+    article_a3_parser.add_argument("--a2-dir", default=None, help="A2 production output directory")
+    article_a3_parser.add_argument("--a1-dir", default=None, help="A1 output directory")
+    article_a3_parser.add_argument("--normalization-final-dir", default=None, help="N4 final normalization directory")
+    article_a3_parser.add_argument("--out", default=None, help="A3 output directory")
+    article_a3_parser.add_argument("--min-confidence", type=_score_float, default=0.5)
+    article_a3_parser.add_argument("--allow-fuzzy-for-review", action="store_true", default=True)
+    article_a3_parser.add_argument("--max-quotes-per-fact-group", type=_positive_int, default=8)
+    article_a3_parser.add_argument("--max-fact-groups-per-tag", type=_positive_int, default=200)
+    article_a3_parser.add_argument("--no-overwrite", action="store_true")
+    article_a3_parser.set_defaults(func=run_article_a3)
 
     return parser
 
@@ -988,6 +1003,60 @@ def run_article_a2(args: argparse.Namespace) -> int:
         print(f"WARNING: {warning}")
     if len(warnings) > 10:
         print(f"WARNING: {len(warnings) - 10} more warnings in a2_report.json")
+    return 0
+
+
+def run_article_a3(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data)
+    logger = configure_logging(data_dir)
+    config = A3Config.from_data_dir(
+        data_dir,
+        a2_dir=Path(args.a2_dir) if args.a2_dir else None,
+        a1_dir=Path(args.a1_dir) if args.a1_dir else None,
+        normalization_final_dir=Path(args.normalization_final_dir) if args.normalization_final_dir else None,
+        out_dir=Path(args.out) if args.out else None,
+        min_confidence=args.min_confidence,
+        allow_fuzzy_for_review=args.allow_fuzzy_for_review,
+        max_quotes_per_fact_group=args.max_quotes_per_fact_group,
+        max_fact_groups_per_tag=args.max_fact_groups_per_tag,
+        overwrite=not args.no_overwrite,
+    )
+    logger.info(
+        "article A3 started data_dir=%s a2_dir=%s a1_dir=%s normalization_final_dir=%s out=%s min_confidence=%s",
+        config.data_dir,
+        config.a2_dir,
+        config.a1_dir,
+        config.normalization_final_dir,
+        config.out_dir,
+        config.min_confidence,
+    )
+    try:
+        report = run_article_a3_grouping(config)
+    except Exception as exc:
+        logger.exception("article A3 failed")
+        print(f"Article A3 failed: {exc}")
+        return 1
+
+    counts = report.get("counts", {})
+    quality = report.get("quality", {})
+    logger.info("article A3 finished counts=%s quality=%s", counts, quality)
+    print(
+        "Article A3 complete: "
+        f"evidence={counts.get('a2_evidence_items_total', 0)} "
+        f"valid={counts.get('valid_evidence_items', 0)} "
+        f"review={counts.get('review_evidence_items', 0)} "
+        f"rejected={counts.get('rejected_evidence_items', 0)} "
+        f"fact_groups={counts.get('fact_groups_total', 0)} "
+        f"usable_groups={counts.get('usable_fact_groups', 0)} "
+        f"ready_for_a4={counts.get('ready_for_a4_tags', 0)} "
+        f"quality_passed={quality.get('passed')} "
+        f"out={config.out_dir}"
+    )
+    warnings = report.get("warnings", [])
+    for warning in warnings[:10]:
+        print(f"WARNING: {warning}")
+    if len(warnings) > 10:
+        print(f"WARNING: {len(warnings) - 10} more warnings in a3_report.json")
     return 0
 
 
