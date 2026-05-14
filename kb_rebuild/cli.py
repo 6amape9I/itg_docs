@@ -14,6 +14,8 @@ from kb_rebuild.articles.a3.models import A3Config
 from kb_rebuild.articles.a3.runner import run_article_a3_grouping
 from kb_rebuild.articles.a4.models import A4Config
 from kb_rebuild.articles.a4.runner import run_article_a4_compilation
+from kb_rebuild.articles.a5.models import A5Config
+from kb_rebuild.articles.a5.runner import run_article_a5_export
 from kb_rebuild.articles.planning.models import A0Config
 from kb_rebuild.articles.planning.runner import run_article_planning_a0
 from kb_rebuild.io.jsonl import write_jsonl
@@ -317,6 +319,19 @@ def build_parser() -> argparse.ArgumentParser:
     article_a4_parser.add_argument("--experiment-name", default=None)
     article_a4_parser.add_argument("--allow-production", action="store_true")
     article_a4_parser.set_defaults(func=run_article_a4)
+
+    article_a5_parser = subparsers.add_parser("article-a5-export", help="Assemble deterministic final article exports")
+    article_a5_parser.add_argument("--data", default="data", help="Data directory")
+    article_a5_parser.add_argument("--a1-dir", default=None, help="A1 output directory")
+    article_a5_parser.add_argument("--a3-dir", default=None, help="A3 output directory")
+    article_a5_parser.add_argument("--a4-dir", default=None, help="A4 production output directory")
+    article_a5_parser.add_argument("--entities-dir", default=None, help="A1 entity JSON directory")
+    article_a5_parser.add_argument("--normalization-final-dir", default=None, help="N4 final normalization directory")
+    article_a5_parser.add_argument("--out", default=None, help="A5 final export output directory")
+    article_a5_overwrite = article_a5_parser.add_mutually_exclusive_group()
+    article_a5_overwrite.add_argument("--overwrite", dest="overwrite", action="store_true", default=False)
+    article_a5_overwrite.add_argument("--no-overwrite", dest="overwrite", action="store_false")
+    article_a5_parser.set_defaults(func=run_article_a5)
 
     return parser
 
@@ -1174,6 +1189,52 @@ def run_article_a4(args: argparse.Namespace) -> int:
     if len(warnings) > 10:
         print(f"WARNING: {len(warnings) - 10} more warnings in a4_report.json")
     return 0
+
+
+def run_article_a5(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data)
+    logger = configure_logging(data_dir)
+    config = A5Config.from_data_dir(
+        data_dir,
+        a1_dir=Path(args.a1_dir) if args.a1_dir else None,
+        a3_dir=Path(args.a3_dir) if args.a3_dir else None,
+        a4_dir=Path(args.a4_dir) if args.a4_dir else None,
+        entities_dir=Path(args.entities_dir) if args.entities_dir else None,
+        normalization_final_dir=Path(args.normalization_final_dir) if args.normalization_final_dir else None,
+        out_dir=Path(args.out) if args.out else None,
+        overwrite=args.overwrite,
+    )
+    logger.info(
+        "article A5 started data_dir=%s a1_dir=%s a3_dir=%s a4_dir=%s entities_dir=%s out=%s overwrite=%s",
+        config.data_dir,
+        config.a1_dir,
+        config.a3_dir,
+        config.a4_dir,
+        config.entities_dir,
+        config.out_dir,
+        config.overwrite,
+    )
+    try:
+        report = run_article_a5_export(config)
+    except Exception as exc:
+        logger.exception("article A5 failed")
+        print(f"Article A5 failed: {exc}")
+        return 1
+
+    counts = report.get("counts", {})
+    quality = report.get("quality", {})
+    logger.info("article A5 finished counts=%s quality=%s", counts, quality)
+    print(
+        "Article A5 complete: "
+        f"final_tags={counts.get('final_tags_total', 0)} "
+        f"n8n={counts.get('for_n8n_article_files', 0)} "
+        f"docs={counts.get('for_docs_article_files', 0)} "
+        f"quotes_files={counts.get('for_docs_quotes_files', 0)} "
+        f"issues={counts.get('export_quality_issues', 0)} "
+        f"quality_passed={quality.get('passed')} "
+        f"out={config.out_dir}"
+    )
+    return 0 if quality.get("passed") is True else 1
 
 
 def configure_logging(out_dir: Path) -> logging.Logger:
